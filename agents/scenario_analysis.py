@@ -147,7 +147,7 @@ class ScenarioAnalysisAgent(BaseAgent):
                 f"Weights: Bear={weights['BEAR']*100:.0f}% Base={weights['BASE']*100:.0f}% Bull={weights['BULL']*100:.0f}%",
                 risk_level=RiskClassification.HIGH, confidence=0.75,
             ))
-        elif weights["BULL"] > 0.35:
+        elif weights["BULL"] >= 0.30:
             findings.append(self.green_flag(
                 f"Elevated bull scenario probability: {weights['BULL']*100:.0f}%",
                 "Multiple positive signals suggest above-average probability of bull case materializing.",
