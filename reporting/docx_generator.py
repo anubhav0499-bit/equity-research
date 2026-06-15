@@ -415,7 +415,9 @@ def _add_quarterly_snapshot(doc, state, currency):
     _section_bar(doc, "Result Snapshot (Annual YoY)")
 
     history = state.financial_history or {}
-    annual_years = sorted([k for k in history.keys() if len(k) == 4])
+    # financial_history is FinancialHistory.model_dump() — top-level keys are field names,
+    # not year strings. Years live in the "available_years" list.
+    annual_years = sorted(history.get("available_years", []))
     if len(annual_years) < 2:
         doc.add_paragraph("Insufficient annual data for comparison.")
         return
@@ -425,9 +427,9 @@ def _add_quarterly_snapshot(doc, state, currency):
     yago = annual_years[-3] if len(annual_years) >= 3 else annual_years[0]
 
     def _qv(yr, *keys):
-        d = history.get(yr, {})
+        # history["income_statements"][year] → flat dict of fields
         for sect in ("income_statements", "balance_sheets", "cash_flows"):
-            sd = d.get(sect) or {}
+            sd = (history.get(sect) or {}).get(yr) or {}
             for k in keys:
                 v = sd.get(k)
                 if v is not None:
@@ -484,8 +486,8 @@ def _add_quarterly_snapshot(doc, state, currency):
 
         bg = _LBKG if label.startswith("**") else (_LGY if ri % 2 else _WHT)
         vals = [clean, _fmt(vc), _fmt(vp), _fmt(vya),
-                _chg(vc, vp) if vc and vp else _NA,
-                _chg(vc, vya) if vc and vya else _NA]
+                _chg(vc, vp) if vc is not None and vp is not None else _NA,
+                _chg(vc, vya) if vc is not None and vya is not None else _NA]
 
         for ci, val in enumerate(vals):
             c = t.rows[ri + 1].cells[ci]
@@ -527,13 +529,16 @@ def _add_concall_highlights(doc, state, company):
     # Extract bullets from LLM analysis as fallback content
     llm_bullets = _extract_bullets(llm_analysis, max_bullets=12) if llm_analysis else []
 
-    # Group available content into topic buckets
+    # When guidance_bullets cover slot 0, distribute llm_bullets from index 0 in subsequent slots.
+    # When no guidance_bullets, llm_bullets fills all slots sequentially from 0.
+    # Either way, no bullets are skipped.
+    llm_offset = 0  # always start from index 0 in llm_bullets for subsequent topics
     topics = {
-        "Management Guidance": guidance_bullets[:4] if guidance_bullets else llm_bullets[:3],
-        "Revenue and Demand Outlook": llm_bullets[3:6] if len(llm_bullets) > 3 else [],
-        "Margin Commentary": llm_bullets[6:9] if len(llm_bullets) > 6 else [],
-        "Deal Wins / Strategic Initiatives": [],
-        "Outlook and Key Monitorables": llm_bullets[9:12] if len(llm_bullets) > 9 else [],
+        "Management Guidance":               guidance_bullets[:4] if guidance_bullets else llm_bullets[0:3],
+        "Revenue and Demand Outlook":        llm_bullets[0:3]  if guidance_bullets else llm_bullets[3:6],
+        "Margin Commentary":                 llm_bullets[3:6]  if guidance_bullets else llm_bullets[6:9],
+        "Deal Wins / Strategic Initiatives": llm_bullets[6:9]  if guidance_bullets else llm_bullets[9:12],
+        "Outlook and Key Monitorables":      llm_bullets[9:12] if guidance_bullets else [],
     }
 
     has_content = False
@@ -597,7 +602,8 @@ def _add_performance_table(doc, state, currency):
     forecasts = (fm_out.payload.get("forecasts", {}) if fm_out else {})
     base_f    = forecasts.get("BASE", [])
     history   = state.financial_history or {}
-    years_hist = sorted([k for k in history.keys() if len(k) == 4])[-4:]
+    # available_years holds the indexed year strings; top-level keys are field names
+    years_hist = sorted(history.get("available_years", []))[-4:]
 
     est_years = [str(f.get("year", f"FY+{i+1}E")) for i, f in enumerate(base_f[:3])]
     all_cols  = years_hist + est_years
@@ -609,9 +615,8 @@ def _add_performance_table(doc, state, currency):
     rows: List[List[str]] = []
 
     def _hval(yr, *keys):
-        d = history.get(yr, {})
         for sect in ("income_statements", "balance_sheets", "cash_flows"):
-            sd = d.get(sect) or {}
+            sd = (history.get(sect) or {}).get(yr) or {}
             for k in keys:
                 v = sd.get(k)
                 if v is not None:
@@ -849,9 +854,10 @@ def _add_peer_table(doc, state, company, currency):
     mkt_data  = (mkt_out.payload.get("market_data", {}) if mkt_out else {}) or {}
     peers_raw = mkt_data.get("peer_market_data", []) or []
 
-    valuation_narrative = ""  # no dedicated peer valuation narrative available
+    # Peer valuation narrative: pull from narrative agent's report sections if available
+    valuation_narrative = state.report_sections.get(SectionType.VALUATION.value, "")
     if valuation_narrative:
-        _add_content_paragraphs(doc, valuation_narrative, max_chars=500)
+        _add_content_paragraphs(doc, valuation_narrative, max_chars=300)
 
     hdr = [
         "Company", f"CMP ({currency})", "Mkt Cap (USD Bn)",
@@ -979,7 +985,7 @@ def _add_valuation_section(doc, state, company, currency, cmp_px, tgt_px, upside
     base_case  = val.get("base_case", {}) or {}
     dcf_val    = base_case.get("dcf", {}).get("intrinsic_value_per_share") if base_case.get("dcf") else None
     rel_val    = base_case.get("relative", {}).get("blended_value_per_share") if base_case.get("relative") else None
-    sotp_val   = base_case.get("sotp", {}).get("intrinsic_value_per_share") if base_case.get("sotp") else None
+    sotp_val   = base_case.get("sotp", {}).get("value_per_share") if base_case.get("sotp") else None  # SumOfPartsModel uses value_per_share
 
     # Blended target table
     rows = [
@@ -1453,7 +1459,8 @@ def _add_disclaimer(doc, company, report_date):
 
 def _collect_financial_data(state: ResearchState) -> dict:
     history    = state.financial_history or {}
-    hist_years = sorted([k for k in history.keys() if len(k) == 4])[-5:]
+    # financial_history is FinancialHistory.model_dump() — years are in "available_years"
+    hist_years = sorted(history.get("available_years", []))[-5:]
 
     fm_out    = state.agent_outputs.get("07_financial_modeling")
     forecasts = (fm_out.payload.get("forecasts", {}) if fm_out else {})
@@ -1464,9 +1471,9 @@ def _collect_financial_data(state: ResearchState) -> dict:
     years = hist_years + est_labels
 
     def _hv(yr, *keys):
-        d = history.get(yr, {})
+        # history["income_statements"][year] → flat dict of all statement fields
         for sect in ("income_statements", "balance_sheets", "cash_flows"):
-            sd = d.get(sect) or {}
+            sd = (history.get(sect) or {}).get(yr) or {}
             for k in keys:
                 v = sd.get(k)
                 if v is not None:
