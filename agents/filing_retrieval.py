@@ -65,6 +65,9 @@ class FilingRetrievalAgent(BaseAgent):
         # ── Download files ────────────────────────────────────────
         downloaded = self._download_documents(acquired)
 
+        # ── Index into RAG vector store ───────────────────────────
+        self._index_downloaded(downloaded, ticker)
+
         # ── Assess coverage ───────────────────────────────────────
         annual_count = sum(1 for d in downloaded if d.get("type") == "annual_report")
         if annual_count == 0:
@@ -299,6 +302,66 @@ class FilingRetrievalAgent(BaseAgent):
         if "DEF 14A" in form or form == "PROXY":
             return "governance"
         return None
+
+    def _index_downloaded(self, downloaded: list[dict], ticker: str) -> None:
+        """Extract text from downloaded filings and index into the per-ticker vector store."""
+        try:
+            from ..retrieval import ingest_document
+        except Exception:
+            return  # retrieval subsystem not installed — skip silently
+
+        indexed = 0
+        for doc in downloaded:
+            if not doc.get("downloaded"):
+                continue
+            fname = doc.get("local_filename", "")
+            if not fname:
+                continue
+            try:
+                path = self.storage.raw_filings / fname
+                if not path.exists():
+                    continue
+                raw = path.read_bytes()
+                if fname.lower().endswith(".pdf"):
+                    text = self._extract_pdf_text(raw)
+                else:
+                    from bs4 import BeautifulSoup
+                    text = BeautifulSoup(raw, "html.parser").get_text(separator="\n")
+                text = text[:60000].strip()
+                if len(text) < 200:
+                    continue
+                ingest_document(text, {
+                    "source":    doc.get("source", ""),
+                    "type":      doc.get("type", ""),
+                    "date":      doc.get("date", ""),
+                    "form":      doc.get("form", ""),
+                    "url":       doc.get("source_url", ""),
+                    "ticker":    ticker,
+                }, ticker)
+                indexed += 1
+            except Exception as e:
+                logger.debug(f"[filing_retrieval] index failed for {fname}: {e}")
+        if indexed:
+            logger.info(f"[filing_retrieval] indexed {indexed} documents into RAG ({ticker})")
+
+    @staticmethod
+    def _extract_pdf_text(raw: bytes) -> str:
+        try:
+            from pdfminer.high_level import extract_text_to_fp
+            from pdfminer.layout import LAParams
+            import io
+            out = io.StringIO()
+            extract_text_to_fp(io.BytesIO(raw), out, laparams=LAParams())
+            return out.getvalue()
+        except Exception:
+            pass
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception:
+            pass
+        return raw.decode("utf-8", errors="ignore")
 
     def _get(self, url: str, headers: dict = None, timeout: int = 30) -> Optional[httpx.Response]:
         try:

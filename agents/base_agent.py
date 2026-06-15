@@ -154,6 +154,25 @@ class BaseAgent(ABC):
             quantified_impact=quantified_impact,
         )
 
+    def rag_query(self, question: str, state: ResearchState, top_k: int = 5) -> str:
+        """
+        Query the equity RAG pipeline for contextual information about the company.
+        Uses the per-ticker vector store (filed documents + indexed transcripts) as
+        the primary source, falling back to internet and tools as needed.
+
+        Returns the answer string; logs a warning on failure.
+        """
+        ticker = (state.company_profile or {}).get("ticker", state.ticker) or "UNKNOWN"
+        company = (state.company_profile or {}).get("name", state.company_name)
+        try:
+            from ..retrieval.rag_pipeline import query as _rag_q
+            answer = _rag_q(question, company_name=company, ticker=ticker)
+            self._logger.debug(f"rag_query answered ({len(answer)} chars): {question[:60]}")
+            return answer
+        except Exception as e:
+            self._logger.warning(f"rag_query failed: {e}")
+            return ""
+
     def red_flag(self, title: str, detail: str, evidence: str,
                  risk_level: RiskClassification = RiskClassification.HIGH,
                  **kwargs) -> Finding:

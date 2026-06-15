@@ -104,6 +104,20 @@ class TranscriptRetrievalAgent(BaseAgent):
 
         # ── LLM analysis of transcripts ───────────────────────────
         combined_text = self._build_transcript_summary(transcripts, company_name, ticker)
+
+        # ── Index transcript text into RAG vector store ───────────
+        try:
+            from ..retrieval import ingest_document
+            ingest_document(combined_text, {
+                "source": "earnings_transcripts",
+                "type":   "transcript",
+                "ticker": ticker,
+                "count":  len(transcripts),
+            }, ticker)
+            logger.debug(f"[transcript_retrieval] indexed transcript corpus ({len(combined_text)} chars) for {ticker}")
+        except Exception as e:
+            logger.debug(f"[transcript_retrieval] RAG indexing failed: {e}")
+
         llm_analysis = self.llm_analyze(
             TRANSCRIPT_SYSTEM,
             combined_text,
