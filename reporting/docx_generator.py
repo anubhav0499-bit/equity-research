@@ -526,19 +526,16 @@ def _add_concall_highlights(doc, state, company):
     else:
         guidance_bullets = []
 
-    # Extract bullets from LLM analysis as fallback content
-    llm_bullets = _extract_bullets(llm_analysis, max_bullets=12) if llm_analysis else []
-
-    # When guidance_bullets cover slot 0, distribute llm_bullets from index 0 in subsequent slots.
-    # When no guidance_bullets, llm_bullets fills all slots sequentially from 0.
-    # Either way, no bullets are skipped.
-    llm_offset = 0  # always start from index 0 in llm_bullets for subsequent topics
+    # 5 topics × 3 bullets each; with guidance, slot 0 uses guidance_bullets and
+    # llm_bullets fill slots 1-4 (indices 0-11). Without guidance, all 5 slots use
+    # llm_bullets sequentially (indices 0-14), so bump max to 15.
+    llm_bullets = _extract_bullets(llm_analysis, max_bullets=15) if llm_analysis else []
     topics = {
         "Management Guidance":               guidance_bullets[:4] if guidance_bullets else llm_bullets[0:3],
         "Revenue and Demand Outlook":        llm_bullets[0:3]  if guidance_bullets else llm_bullets[3:6],
         "Margin Commentary":                 llm_bullets[3:6]  if guidance_bullets else llm_bullets[6:9],
         "Deal Wins / Strategic Initiatives": llm_bullets[6:9]  if guidance_bullets else llm_bullets[9:12],
-        "Outlook and Key Monitorables":      llm_bullets[9:12] if guidance_bullets else [],
+        "Outlook and Key Monitorables":      llm_bullets[9:12] if guidance_bullets else llm_bullets[12:15],
     }
 
     has_content = False
@@ -853,11 +850,6 @@ def _add_peer_table(doc, state, company, currency):
     mkt_out   = state.agent_outputs.get("04_market_data")
     mkt_data  = (mkt_out.payload.get("market_data", {}) if mkt_out else {}) or {}
     peers_raw = mkt_data.get("peer_market_data", []) or []
-
-    # Peer valuation narrative: pull from narrative agent's report sections if available
-    valuation_narrative = state.report_sections.get(SectionType.VALUATION.value, "")
-    if valuation_narrative:
-        _add_content_paragraphs(doc, valuation_narrative, max_chars=300)
 
     hdr = [
         "Company", f"CMP ({currency})", "Mkt Cap (USD Bn)",
