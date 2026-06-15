@@ -411,28 +411,27 @@ def _add_results_section(doc, state, company, ticker, report_date):
 
 
 def _add_quarterly_snapshot(doc, state, currency):
-    """Current Q vs prior Q vs same Q prior year — QoQ / YoY — Deven Choksey Result Snapshot."""
-    _section_bar(doc, "Result Snapshot (Quarterly)")
+    """Annual snapshot (last 2 fiscal years) with YoY — agent 03 only produces annual data."""
+    _section_bar(doc, "Result Snapshot (Annual YoY)")
 
-    q_data = _payload(state, "03_financial_extraction", "quarterly_financial_data", {})
-    if not q_data:
-        q_data = _payload(state, "03_financial_extraction", "quarterly_data", {})
-
-    quarters = sorted(q_data.keys())[-5:] if q_data else []
-    if len(quarters) < 2:
-        doc.add_paragraph("Quarterly data not available.")
+    history = state.financial_history or {}
+    annual_years = sorted([k for k in history.keys() if len(k) == 4])
+    if len(annual_years) < 2:
+        doc.add_paragraph("Insufficient annual data for comparison.")
         return
 
-    cur  = quarters[-1]
-    prv  = quarters[-2]
-    yago = quarters[-5] if len(quarters) >= 5 else quarters[0]
+    cur  = annual_years[-1]
+    prv  = annual_years[-2]
+    yago = annual_years[-3] if len(annual_years) >= 3 else annual_years[0]
 
-    def _qv(q, *keys):
-        d = q_data.get(q, {})
-        for k in keys:
-            v = d.get(k)
-            if v is not None:
-                return v
+    def _qv(yr, *keys):
+        d = history.get(yr, {})
+        for sect in ("income_statements", "balance_sheets", "cash_flows"):
+            sd = d.get(sect) or {}
+            for k in keys:
+                v = sd.get(k)
+                if v is not None:
+                    return v
         return None
 
     def _chg(v1, v2):
@@ -462,7 +461,7 @@ def _add_quarterly_snapshot(doc, state, currency):
         ("**Diluted EPS",     ["diluted_eps", "eps"]),
     ]
 
-    hdr = [f"Particulars ({currency} Mn)", cur, prv, yago, "QoQ", "YoY"]
+    hdr = [f"Particulars ({currency} Mn)", cur, prv, yago, "YoY (cur vs prv)", "2Y (cur vs yago)"]
     t = doc.add_table(rows=1 + len(rows_def), cols=len(hdr))
     t.style = "Table Grid"
 
@@ -509,21 +508,32 @@ def _add_concall_highlights(doc, state, company):
 
     _section_bar(doc, "Key Concall Highlights")
 
-    transcript = _payload(state, "12_transcript_retrieval", "transcript_analysis", {})
-    key_themes  = transcript.get("key_themes", [])
-    guidance    = transcript.get("guidance_statements", [])
-    sentiment   = transcript.get("overall_sentiment", "")
-    mgmt_tone   = transcript.get("management_tone", "")
-    deal_wins   = _payload(state, "12_transcript_retrieval", "deal_wins", [])
-    headcount   = _payload(state, "03_financial_extraction", "employee_data", {})
+    # Agent 12 produces: guidance_summary (dict), sentiment (str), llm_transcript_analysis (str)
+    tr_out      = state.agent_outputs.get("12_transcript_retrieval")
+    tr_pay      = (tr_out.payload if tr_out else {}) or {}
+    sentiment   = tr_pay.get("sentiment", "")
+    mgmt_tone   = ""   # not produced by agent 12; omit
+    guidance_raw = tr_pay.get("guidance_summary", {})
+    llm_analysis = tr_pay.get("llm_transcript_analysis", "")
+
+    # Convert guidance_summary dict to bullet list
+    if isinstance(guidance_raw, dict):
+        guidance_bullets = [f"{k}: {v}" for k, v in guidance_raw.items() if v]
+    elif isinstance(guidance_raw, list):
+        guidance_bullets = [str(x) for x in guidance_raw]
+    else:
+        guidance_bullets = []
+
+    # Extract bullets from LLM analysis as fallback content
+    llm_bullets = _extract_bullets(llm_analysis, max_bullets=12) if llm_analysis else []
 
     # Group available content into topic buckets
     topics = {
-        "Margin Performance and Levers": transcript.get("margin_commentary", guidance[:3] if guidance else []),
-        "Vertical / Segment Performance": transcript.get("vertical_performance", key_themes[:4] if key_themes else []),
-        "Client Budgets and Demand Drivers": transcript.get("demand_drivers", key_themes[4:8] if len(key_themes) > 4 else []),
-        "Deal Wins / Strategic Initiatives": (deal_wins[:4] if deal_wins else transcript.get("deal_commentary", [])),
-        "Outlook and Guidance": (guidance[3:] if len(guidance) > 3 else []),
+        "Management Guidance": guidance_bullets[:4] if guidance_bullets else llm_bullets[:3],
+        "Revenue and Demand Outlook": llm_bullets[3:6] if len(llm_bullets) > 3 else [],
+        "Margin Commentary": llm_bullets[6:9] if len(llm_bullets) > 6 else [],
+        "Deal Wins / Strategic Initiatives": [],
+        "Outlook and Key Monitorables": llm_bullets[9:12] if len(llm_bullets) > 9 else [],
     }
 
     has_content = False
@@ -565,7 +575,7 @@ def _add_concall_highlights(doc, state, company):
 
     if sentiment:
         p = doc.add_paragraph()
-        run = p.add_run(f"Management Sentiment: {sentiment}  |  Tone: {mgmt_tone}")
+        run = p.add_run(f"Management Sentiment: {sentiment}")
         run.font.size = Pt(9)
         run.italic = True
         _color_run(run, _DGRY)
@@ -680,10 +690,14 @@ def _add_scenario_table(doc, state, currency):
         ("Revenue CAGR (5Y %)", "revenue_cagr_pct", "%"),
         ("EBITDA Margin (%)",   "ebitda_margin",    "%"),
         ("PAT CAGR (5Y %)",     "pat_cagr_pct",     "%"),
-        ("Target Price",        "price_target",     currency),
+        ("Target Price",        "implied_price",    currency),   # scenario agent uses implied_price
         ("Upside/Downside",     "upside_pct",       "%"),
-        ("Probability",         "probability_pct",  "%"),
+        ("Probability",         "_probability",     "%"),        # comes from probability_weights dict
     ]
+
+    # Agent 15 stores scenarios under scen_pay["scenarios"]["BEAR/BASE/BULL"]
+    scenarios_dict    = scen_pay.get("scenarios", {}) or {}
+    probability_weights = scen_pay.get("probability_weights", {}) or {}
 
     t = doc.add_table(rows=1 + len(rows_data), cols=len(hdr))
     t.style = "Table Grid"
@@ -700,8 +714,12 @@ def _add_scenario_table(doc, state, currency):
         t.rows[ri + 1].cells[0].text = lbl
         for ci, s in enumerate(labels):
             cell = t.rows[ri + 1].cells[ci + 1]
-            sd   = scen_pay.get(s.lower(), {}) or (forecasts.get(s, [{}]) or [{}])[0]
-            v    = sd.get(key)
+            if key == "_probability":
+                raw = probability_weights.get(s)
+                v = raw * 100 if isinstance(raw, float) and raw <= 1 else raw
+            else:
+                sd = scenarios_dict.get(s, {}) or (forecasts.get(s, [{}]) or [{}])[0]
+                v  = sd.get(key)
             if v is not None:
                 cell.text = f"{unit}{v:.1f}" if unit == currency else f"{v:.1f}{unit}"
             else:
@@ -709,7 +727,7 @@ def _add_scenario_table(doc, state, currency):
             if cell.paragraphs[0].runs:
                 cell.paragraphs[0].runs[0].font.size = _pt(9)
 
-    pwtp = scen_pay.get("probability_weighted_target_price")
+    pwtp = scen_pay.get("probability_weighted_target")  # was wrongly "probability_weighted_target_price"
     if pwtp:
         p = doc.add_paragraph()
         r = p.add_run(f"Probability-Weighted Target Price: {currency}{pwtp:.2f}")
@@ -738,7 +756,8 @@ def _add_estimate_revision_table(doc, state, currency):
         doc.add_paragraph("Forecast data not available.")
         return
 
-    revision_text = fm_out.payload.get("revision_commentary", "")
+    # Agent 07 produces "llm_modeling_commentary", not "revision_commentary"
+    revision_text = fm_out.payload.get("llm_modeling_commentary", "")
     if revision_text:
         _add_content_paragraphs(doc, revision_text, max_chars=600)
     else:
@@ -825,12 +844,12 @@ def _add_estimate_revision_table(doc, state, currency):
 def _add_peer_table(doc, state, company, currency):
     _section_bar(doc, "Peer Comparison")
 
-    peer_out  = state.agent_outputs.get("11_peer_analysis")
-    peers_raw = (peer_out.payload.get("peer_companies", []) if peer_out else [])
-    if not peers_raw:
-        peers_raw = (peer_out.payload.get("peers", []) if peer_out else [])
+    # Peer data lives in agent 04 (market data), not a separate peer agent
+    mkt_out   = state.agent_outputs.get("04_market_data")
+    mkt_data  = (mkt_out.payload.get("market_data", {}) if mkt_out else {}) or {}
+    peers_raw = mkt_data.get("peer_market_data", []) or []
 
-    valuation_narrative = (peer_out.payload.get("valuation_narrative", "") if peer_out else "")
+    valuation_narrative = ""  # no dedicated peer valuation narrative available
     if valuation_narrative:
         _add_content_paragraphs(doc, valuation_narrative, max_chars=500)
 
@@ -950,19 +969,24 @@ def _add_valuation_section(doc, state, company, currency, cmp_px, tgt_px, upside
     wacc_in = val.get("wacc_inputs", {}) or {}
     wacc_val = wacc_in.get("wacc", _NA)
 
-    # Valuation narrative
-    val_narr = val.get("llm_valuation_narrative", "") or \
-               _payload(state, "08_valuation", "llm_valuation_narrative", "")
+    # Valuation narrative — agent 08 stores as "llm_valuation_commentary"
+    val_narr = _payload(state, "08_valuation", "llm_valuation_commentary", "") or \
+               state.report_sections.get(SectionType.VALUATION.value, "")
     if val_narr:
         _add_content_paragraphs(doc, val_narr, max_chars=800)
+
+    # Extract per-method implied values from nested ValuationSummary structure
+    base_case  = val.get("base_case", {}) or {}
+    dcf_val    = base_case.get("dcf", {}).get("intrinsic_value_per_share") if base_case.get("dcf") else None
+    rel_val    = base_case.get("relative", {}).get("blended_value_per_share") if base_case.get("relative") else None
+    sotp_val   = base_case.get("sotp", {}).get("intrinsic_value_per_share") if base_case.get("sotp") else None
 
     # Blended target table
     rows = [
         ("Valuation Method",     "Weight",   "Implied Value"),
-        ("DCF (Base Case)",      "40%",      f"{currency}{_fmt(val.get('dcf_value'))}"),
-        ("Peer EV/EBITDA",       "30%",      f"{currency}{_fmt(val.get('relative_value'))}"),
-        ("SOTP",                 "20%",      f"{currency}{_fmt(val.get('sotp_value'))}"),
-        ("FCF Yield / DDM",      "10%",      f"{currency}{_fmt(val.get('fcf_yield_value'))}"),
+        ("DCF (Base Case)",      "50%",      f"{currency}{_fmt(dcf_val)}" if dcf_val else _NA),
+        ("Peer Relative / EV",   "50%",      f"{currency}{_fmt(rel_val)}" if rel_val else _NA),
+        ("SOTP",                 "—",        f"{currency}{_fmt(sotp_val)}" if sotp_val else _NA),
         ("Blended Target Price", "100%",     f"{currency}{_fmt(tgt_px)}"),
         ("Current Market Price", "—",        f"{currency}{_fmt(cmp_px)}"),
         ("Upside / (Downside)",  "—",        f"{f'{upside:+.1f}%' if upside else _NA}"),
@@ -1028,7 +1052,10 @@ def _add_forensic_section(doc, state, company):
     _section_bar(doc, "Forensic Accounting & Quality Assessment")
 
     forensic = _payload(state, "06_forensic_accounting", "details", {})
-    acctq    = _payload(state, "05_accounting_quality", "quality_metrics", {})
+    # Agent 05 exposes scores as direct payload keys, not nested in "quality_metrics"
+    cash_conv_score = _payload(state, "05_accounting_quality", "cash_conversion_score", _NA)
+    accrual_score   = _payload(state, "05_accounting_quality", "accrual_score", _NA)
+    rev_qual_score  = _payload(state, "05_accounting_quality", "revenue_quality_score", _NA)
 
     scores_data = [
         ("Score", "Value", "Threshold", "Interpretation"),
@@ -1049,8 +1076,16 @@ def _add_forensic_section(doc, state, company):
          "< 5% preferred",
          ""),
         ("Cash Conversion (OCF/NI)",
-         str(acctq.get("cash_conversion", _NA)),
+         str(cash_conv_score),
          "> 0.8× preferred",
+         ""),
+        ("Accrual Score",
+         str(accrual_score),
+         "< 0.1 preferred",
+         ""),
+        ("Revenue Quality Score",
+         str(rev_qual_score),
+         "> 0.7 preferred",
          ""),
     ]
 
