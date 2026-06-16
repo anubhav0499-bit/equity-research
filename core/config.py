@@ -107,7 +107,7 @@ class EmbeddingConfig:
     device: str = "cpu"
     batch_size: int = 32
     chunk_size: int = 512
-    chunk_overlap: int = 64
+    chunk_overlap: int = 100
 
 EMBEDDING_CONFIG = EmbeddingConfig()
 
@@ -183,3 +183,33 @@ FORENSIC_THRESHOLDS = ForensicThresholds()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = DATA_DIR / "logs"
+
+
+def validate_llm_config() -> str:
+    """
+    Return the active provider name, or raise RuntimeError with setup instructions
+    if no LLM provider is reachable.
+    """
+    _keys = {
+        "groq":        GROQ_API_KEY,
+        "openai":      OPENAI_API_KEY,
+        "anthropic":   ANTHROPIC_API_KEY,
+        "together":    TOGETHER_API_KEY,
+        "openrouter":  OPENROUTER_API_KEY,
+        "gemini":      GOOGLE_API_KEY,
+    }
+    if LLM_PROVIDER != "auto":
+        if LLM_PROVIDER == "ollama":
+            return "ollama"
+        if _keys.get(LLM_PROVIDER, ""):
+            return LLM_PROVIDER
+        raise RuntimeError(
+            f"LLM_PROVIDER is set to '{LLM_PROVIDER}' but {LLM_PROVIDER.upper()}_API_KEY is empty.\n"
+            f"Set the key in .env or switch LLM_PROVIDER=auto to use any available provider."
+        )
+    # auto — cascade through providers
+    for provider, key in _keys.items():
+        if key:
+            return provider
+    # Ollama is always last resort (no key needed)
+    return "ollama"

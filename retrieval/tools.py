@@ -14,7 +14,18 @@ from __future__ import annotations
 import ast
 import operator
 from typing import Optional
-from langchain_core.tools import tool
+try:
+    from langchain_core.tools import tool
+except ImportError:
+    def tool(func=None, **kwargs):
+        """No-op @tool stub when langchain_core is not installed."""
+        if func is not None:
+            func.run = func
+            return func
+        def _decorator(f):
+            f.run = f
+            return f
+        return _decorator
 from loguru import logger
 
 from ..core.config import (
@@ -82,20 +93,14 @@ def sec_edgar_search(query: str) -> str:
     """
     try:
         import httpx
-        params = {
-            "q": query,
-            "dateRange": "custom",
-            "startdt": "2019-01-01",
-            "forms": "10-K,10-Q,8-K,20-F",
-            "_source": "hits.hits._source",
-        }
-        url = "https://efts.sec.gov/LATEST/search-index?q={q}&forms={forms}".format(**{
-            "q": query.replace(" ", "+"),
-            "forms": "10-K,10-Q,8-K",
-        })
         r = httpx.get(
             "https://efts.sec.gov/LATEST/search-index",
-            params={"q": query, "forms": "10-K,10-Q,8-K", "hits.hits.total.value": 5},
+            params={
+                "q":         query,
+                "forms":     "10-K,10-Q,8-K",
+                "dateRange": "custom",
+                "startdt":   "2019-01-01",
+            },
             headers={"User-Agent": ACQUISITION_CONFIG.sec_user_agent},
             timeout=15,
         )
@@ -199,7 +204,13 @@ def _safe_eval(node):
         op = _SAFE_OPS.get(type(node.op))
         if op is None:
             raise ValueError(f"Operator not allowed: {type(node.op).__name__}")
-        return op(_safe_eval(node.left), _safe_eval(node.right))
+        left  = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            raise ValueError(f"Non-numeric operands not allowed: {type(left).__name__}, {type(right).__name__}")
+        if isinstance(node.op, ast.Pow) and abs(right) > 10_000:
+            raise ValueError(f"Exponent too large: {right} (max 10000)")
+        return op(left, right)
     if isinstance(node, ast.UnaryOp):
         op = _SAFE_OPS.get(type(node.op))
         if op is None:
