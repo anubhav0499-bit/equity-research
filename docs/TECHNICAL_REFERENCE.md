@@ -1,7 +1,7 @@
 # Equity Intelligence Research Platform — Technical Reference
 
 > **Handover document.** Covers architecture, configuration, data flow, deployment,
-> testing, and extension points. Written against commit `3fa8c0b` (2026-06-17).
+> testing, and extension points. Written against commit `fbb6d4d` (2026-06-18).
 
 ---
 
@@ -40,10 +40,18 @@ DOCX report — without human intervention.
 | Agents | 20 |
 | Orchestration phases | 6 (A–F) |
 | Research sequence steps | 11 (macro → industry → business → management → financial → risks → accounting → governance → forecast → valuation → thesis) |
-| RAG pipeline nodes | 7 (LangGraph) |
-| Embedding model | `BAAI/bge-large-en-v1.5` (1024-dim) |
+| RAG pipeline nodes | 9 (LangGraph) |
+| Embedding model | `BAAI/bge-small-en-v1.5` (~130 MB, local, fallback: `all-MiniLM-L6-v2`) |
+| Chunking strategies | 3 — recursive, contextual (10-K section-aware), semantic (embedding-similarity) |
 | Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
-| Vector DB | ChromaDB (per-ticker persistent collections) |
+| Vector DB | FAISS `IndexFlatIP`, child (256-token) + parent (1024-token) multi-vector |
+| Hybrid retrieval | Dense (FAISS) + BM25 keyword, merged via Reciprocal Rank Fusion |
+| Query enhancement | HyDE — hypothetical document embedding blended 50/50 with query vector |
+| Context compression | Keyword filter → LLM sentence extraction → Jaccard dedup |
+| Conversation memory | Session-keyed sliding window with LLM rolling summary |
+| Guardrails | Rule-based number/date grounding + LLM faithfulness + composite confidence |
+| RAGAS evaluation | Context relevance, faithfulness, answer relevance (geometric mean) |
+| Streaming | SSE via `POST /stream` — `AsyncGenerator` token-by-token |
 | LLM providers supported | OpenAI, Anthropic, Groq, Gemini, Together, OpenRouter, Ollama |
 | Compliance checks | 17 (7 Indian standards + 10 global standards) |
 | Backtest score | 92.7 / 100 (MRR 0.976, Security 100/100, Scalability 96/100) |
@@ -99,15 +107,23 @@ equity_research/
 │   └── state.py                ResearchState dataclass — shared agent memory
 │
 ├── retrieval/
-│   ├── __init__.py             Lazy imports (no eager llama_index at import time)
-│   ├── vector_store.py         ChromaDB + LlamaIndex + BM25+RRF+CrossEncoder
-│   ├── rag_pipeline.py         7-node LangGraph pipeline
-│   ├── tools.py                LangChain tools: calculator, SEC, web, Wikipedia
+│   ├── __init__.py             Lazy imports
+│   ├── vector_store.py         FAISS IndexFlatIP, child(256)+parent(1024) multi-vector,
+│   │                           BM25+RRF+cross-encoder; persists to data/faiss_index/<TICKER>/
+│   ├── rag_pipeline.py         9-node LangGraph pipeline (HyDE, context compression,
+│   │                           guardrails, conversation memory, stream_run() SSE generator)
+│   ├── chunking.py             SmartChunker — recursive / contextual / semantic; auto-detect
+│   ├── hyde.py                 HyDE — generate hypothetical doc, blend embedding 50/50
+│   ├── compression.py          ContextCompressor — keyword filter → LLM extraction → dedup
+│   ├── memory.py               ConversationStore — session window + LLM rolling summary
+│   ├── guardrails.py           GuardrailsChecker — rule-based + LLM faithfulness + confidence
+│   ├── evaluation.py           RAGASEvaluator — context_relevance, faithfulness, answer_relevance
+│   ├── tools.py                LangChain tools: calculator, SEC EDGAR, web search, Wikipedia
 │   └── ingest.py               Document ingestion helpers
 │
 ├── api/
 │   ├── __init__.py
-│   └── server.py               FastAPI production server
+│   └── server.py               FastAPI — /query, /stream (SSE), /ingest, /health
 │
 ├── forensics/
 │   ├── beneish.py              Beneish M-score (8-variable, threshold −1.78)
@@ -144,7 +160,11 @@ equity_research/
 │   └── rag_backtest.py         45-query RAG evaluation + 32 security tests
 │
 └── data/
-    └── chroma_db/<TICKER>/     Per-ticker ChromaDB persistent collections
+    └── faiss_index/<TICKER>/   Per-ticker FAISS persistent collections
+        ├── child_index.faiss   Child (256-token) IndexFlatIP
+        ├── parent_index.faiss  Parent (1024-token) IndexFlatIP
+        ├── child_docs.json     Child chunk texts + parent_id references
+        └── parent_docs.json    Parent chunk texts + metadata
 ```
 
 ---
@@ -154,8 +174,8 @@ equity_research/
 ### Prerequisites
 
 - Python 3.10+ (tested on 3.14)
-- 8 GB RAM minimum (16 GB recommended for BGE-large + ChromaDB in process)
-- 2 GB disk for models (BGE-large downloads automatically from HuggingFace)
+- 4 GB RAM minimum (8 GB recommended for parallel agents + FAISS index)
+- ~200 MB disk for models (BGE-small ~130 MB, cross-encoder ~80 MB, both downloaded automatically)
 
 ### Install
 
@@ -241,6 +261,35 @@ forensics:
   altman_em_safe: 2.60                    # Z > 2.60 → safe zone
   piotroski_strong: 7                     # F ≥ 7 → strong
 ```
+
+### RAGConfig (`core/config.py`)
+
+All RAG hyperparameters in one dataclass. Override any field before calling the API:
+
+```python
+from equity_research.core.config import RAG_CONFIG
+RAG_CONFIG.top_k = 8
+RAG_CONFIG.hyde_enabled = False
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `model_name` | `BAAI/bge-small-en-v1.5` | Primary embedding model |
+| `fallback_model` | `all-MiniLM-L6-v2` | Fallback if BGE unavailable |
+| `chunking_mode` | `auto` | `auto` \| `recursive` \| `contextual` \| `semantic` |
+| `child_chunk_size` | `256` | Tokens per child chunk (precision retrieval) |
+| `parent_chunk_size` | `1024` | Tokens per parent chunk (rich context window) |
+| `top_k` | `5` | Final chunks returned per query |
+| `candidate_multiplier` | `4` | Candidate pool = `top_k × candidate_multiplier` |
+| `hyde_enabled` | `True` | Enable HyDE on first retrieval iteration |
+| `compression_enabled` | `True` | Enable context compression before generation |
+| `compression_max_chars` | `8000` | Character budget after compression |
+| `memory_max_turns` | `10` | Max raw turns in session window |
+| `memory_max_chars` | `4000` | Character budget before LLM compression |
+| `groundedness_threshold` | `0.70` | Guardrails: min groundedness score to pass |
+| `confidence_threshold` | `0.60` | Min composite confidence for final answer |
+| `ragas_enabled` | `False` | Enable RAGAS evaluation (adds 3 LLM calls) |
+| `vector_backend` | `faiss` | Currently only `faiss` |
 
 ### Output paths
 
@@ -450,91 +499,225 @@ WARN placeholders ensure the compliance score denominator stays consistent even 
 
 ## 7. RAG Subsystem
 
-The RAG subsystem is independent of the 17-agent pipeline. It answers analyst
-questions grounded on ingested company documents. The main pipeline uses it inside
-`retriever` nodes; it can also be called standalone via the API or directly.
+The RAG subsystem is independent of the agent pipeline. It answers analyst
+questions grounded on ingested company documents. The main pipeline calls it via
+`rag_query` in `BaseAgent`; it can also be called standalone via the HTTP API or
+directly from Python.
 
 ### 7.1 Vector store (`retrieval/vector_store.py`)
 
-**Storage:** One ChromaDB `PersistentClient` per ticker, stored at
-`data/chroma_db/<TICKER>/`. Collections are named `er_<ticker_lowercase>`.
+**Storage:** One FAISS directory per ticker at `data/faiss_index/<TICKER>/`.
+Each ticker holds 4 files: `child_index.faiss`, `parent_index.faiss`,
+`child_docs.json`, `parent_docs.json`.
 
-**Embedding model:** `BAAI/bge-large-en-v1.5` (1024-dimensional, loaded via
-LlamaIndex `HuggingFaceEmbedding`). Downloaded automatically on first use (~1.4 GB).
-Requires `sentence-transformers` or `llama-index-embeddings-huggingface`.
+**Embedding model:** `BAAI/bge-small-en-v1.5` (~130 MB, downloaded automatically).
+L2-normalized before indexing so `IndexFlatIP` (inner product) computes cosine similarity.
+Fallback: `all-MiniLM-L6-v2` (~90 MB) if BGE unavailable.
 
-**Chunking:** `SentenceSplitter`, chunk_size=512 tokens, overlap=100 tokens.
+**Multi-vector architecture (child + parent):**
+
+| Index | Chunk size | Overlap | Purpose |
+|---|---|---|---|
+| Child | 256 tokens | 32 tokens | High-precision retrieval (small chunks → tight semantic match) |
+| Parent | 1024 tokens | 128 tokens | Rich context window returned to the LLM |
+
+At ingest time, a document is split into parent chunks (via `SmartChunker`), then
+each parent chunk is further split into child chunks. At query time, the child index
+is searched for nearest neighbours; the corresponding parent chunks are returned as
+context.
 
 **Retrieval pipeline (per query):**
 
 ```
-query(question, ticker, top_k=5, metadata_filter=None)
+query(question, ticker, top_k=5, metadata_filter=None, hyde_vec=None)
 
-1. Cache check          — (question, ticker, top_k, filter) → list[str], TTL=5 min
-2. Dense retrieval      — VectorIndexRetriever(top_k × 4 candidates, min 20)
-                          gated by threading.Semaphore(min(cpu_count, 8)) to limit
-                          concurrent BGE encoding on CPU
-3. Metadata filtering   — post-retrieval filter by any metadata field
-4. BM25 keyword scoring — TF (k1=1.5, b=0.75) per query term
-5. Reciprocal Rank Fusion — merge dense rank + keyword rank (RRF constant=60)
-6. Cross-encoder rerank — if sentence-transformers installed; runs when
-                          len(candidates) > top_k (skipped on small corpora to
-                          avoid ms-marco score inversion on financial text)
-7. Return top-k + write cache
+1. Dense retrieval     — FAISS IndexFlatIP over child vectors
+                         candidates = max(top_k × 4, 20)
+                         optional: pass hyde_vec to search with blended HyDE embedding
+2. Parent lookup       — map child hits → parent chunk texts
+3. Metadata filter     — post-retrieval filter by any metadata field
+4. BM25 scoring        — rank-bm25 IDF-weighted term frequency per query term
+5. Reciprocal Rank Fusion — merge dense rank + BM25 rank (RRF constant=60)
+6. Cross-encoder rerank  — ms-marco-MiniLM-L-6-v2; runs when candidates > top_k
+7. Return top-k parent chunks
 ```
 
-**Cache eviction:** Up to 500 entries stored; at 500+, all entries older than
-TTL=300s are evicted. Cache is in-process (not shared across workers).
-
-**Public API:**
+**Public API** (unchanged from previous version — no call-site changes required):
 
 ```python
 from equity_research.retrieval.vector_store import (
     ingest_document,   # (text, metadata, ticker) → int (chunks added)
     ingest_texts,      # (texts, metadatas, ticker) → int
-    query,             # (question, ticker, top_k, metadata_filter) → list[str]
+    query,             # (question, ticker, top_k, metadata_filter, hyde_vec) → list[str]
     collection_size,   # (ticker) → int
     clear_company,     # (ticker) → None
 )
 ```
 
-### 7.2 RAG pipeline (`retrieval/rag_pipeline.py`)
+### 7.2 SmartChunker (`retrieval/chunking.py`)
 
-A 7-node LangGraph `StateGraph`. Requires `langchain-core` and `langgraph` to
-execute; can be imported without them (graceful stubs) for testing.
+Three splitting strategies selected manually or via auto-detect:
+
+| Strategy | Trigger | Behaviour |
+|---|---|---|
+| `contextual` | Auto: high header density (>2 `ITEM`/`PART`/`MD&A` headers per 50 lines) | Splits on 10-K/annual report section headers; stores `section_header` in metadata |
+| `recursive` | Auto: high number density (financial tables) or default | Hierarchical separator splitting: `\n\n` → `\n` → `. ` → ` ` |
+| `semantic` | Auto: low number density + long avg line length (narrative text) | Embedding-similarity boundary detection; falls back to recursive if embed_fn unavailable |
+
+**Auto-detect heuristics** (`auto_detect_strategy`):
+1. If header density > 2 per 50 lines → `contextual`
+2. Else if avg line length > 120 chars → `semantic`
+3. Else → `recursive`
+
+### 7.3 HyDE (`retrieval/hyde.py`)
+
+Hypothetical Document Embeddings improve retrieval for abstract or analytical queries
+where the literal query text is distant from the answer's vocabulary.
+
+```
+Query: "How did Apple manage its working capital?"
+ ↓
+LLM generates a ~100-word hypothetical answer passage
+ ↓
+Embed both query and hypothetical passage
+ ↓
+Blended vector = 0.5 × query_vec + 0.5 × hypo_vec  (L2-normalised)
+ ↓
+FAISS search with blended vector
+```
+
+HyDE runs only on the first retrieval iteration (subsequent loops use the plain query
+to avoid compounding errors). Disabled when `RAG_CONFIG.hyde_enabled = False`.
+Returns `None` on any failure — callers fall back to plain query embedding.
+
+### 7.4 Context Compression (`retrieval/compression.py`)
+
+Reduces the context window before generation, improving answer quality and cutting
+LLM input tokens by 50–70% on typical financial documents.
+
+**Four stages:**
+
+1. **Keyword filter** — drop chunks whose query-term overlap is below `keyword_threshold` (default 10%)
+2. **LLM extraction** — per remaining chunk, ask the LLM to extract only the sentences
+   relevant to the query; chunks returning `[IRRELEVANT]` are dropped
+3. **Jaccard dedup** — remove near-duplicate chunks (>85% character-level overlap on
+   first 200 chars)
+4. **Char budget truncation** — truncate total output to `compression_max_chars` (default 8000)
+
+Disabled when `RAG_CONFIG.compression_enabled = False` — the retriever's raw chunks
+are passed directly to the generator.
+
+### 7.5 Conversation Memory (`retrieval/memory.py`)
+
+Session-keyed sliding window allows multi-turn analyst conversations. The history
+context is injected into the `query_rewriter` node so pronouns ("What about the Q2
+figure?") resolve correctly without re-retrieving.
+
+**`ConversationStore` (thread-safe singleton):**
+
+```python
+from equity_research.retrieval.memory import ConversationStore
+
+store = ConversationStore.get()
+store.add_exchange(session_id="s1", question="...", answer="...", sources=["10-K"])
+context = store.get_context("s1", max_chars=3000)
+store.evict_stale(ttl_seconds=3600)
+```
+
+**Compression:** when total chars > `memory_max_chars`, older turns (keeping the last 3
+verbatim) are summarised into a rolling `session.summary` string via one LLM call.
+This keeps the injected context within budget indefinitely.
+
+### 7.6 Guardrails (`retrieval/guardrails.py`)
+
+Three-layer faithfulness check runs after generation in the `relevance_checker` node:
+
+| Layer | Method | Output |
+|---|---|---|
+| Rule-based | Regex-extract numbers + dates from response; check presence in context | `hallucinated_numbers: list[str]`, `rule_score ∈ [0,1]` |
+| LLM faithfulness | Ask LLM to identify unsupported factual claims | `unsupported_claims`, `llm_score ∈ [0,1]` |
+| Composite confidence | `0.40×groundedness + 0.35×relevance + 0.25×retrieval_quality` | `confidence_score ∈ [0,1]` |
+
+`groundedness_score` = average of rule and LLM scores (or rule-only if no LLM fn).
+`grounded = True` when `groundedness_score ≥ RAG_CONFIG.groundedness_threshold` (default 0.70).
+
+Both scores are returned in the `/query` API response for downstream use.
+
+### 7.7 RAGAS Evaluation (`retrieval/evaluation.py`)
+
+LLM-as-judge evaluation — compatible with RAGAS 0–1 scale but no external dependency.
+
+| Metric | Judges | Formula |
+|---|---|---|
+| `context_relevance` | Are retrieved chunks relevant to the question? | Per-chunk score 0–3, normalised |
+| `faithfulness` | Are response claims grounded in context? | `supported_claims / total_claims` |
+| `answer_relevance` | Does the response address the question? | Holistic 0–1 score |
+| `ragas_score` | — | Geometric mean of all three |
+
+Disabled by default (`RAG_CONFIG.ragas_enabled = False`) as it requires 3 extra LLM
+calls per query. Enable for evaluation runs:
+
+```python
+from equity_research.retrieval.evaluation import RAGASEvaluator
+evaluator = RAGASEvaluator(llm_fn=agent.llm_analyze)
+result = evaluator.evaluate(question, context_chunks, response)
+print(result.ragas_score)
+```
+
+### 7.8 RAG pipeline (`retrieval/rag_pipeline.py`)
+
+A 9-node LangGraph `StateGraph`. Requires `langchain-core` and `langgraph`.
+Graceful stubs allow import without LLM dependencies for testing.
 
 **Nodes:**
 
-| # | Node | Responsibility |
+| # | Node | New capability |
 |---|---|---|
-| 1 | `query_rewriter` | Normalise query; on retry loops, SIMPLIFY not expand |
-| 2 | `query_decomposer` | Detect multi-hop; split compound questions into sub-queries |
-| 3 | `detail_checker` | Router: needs retrieval? or parametric LLM knowledge? |
-| 4 | `source_selector` | Pick: `vector_db` / `internet` / `tools_apis` / `combined` |
-| 5 | `retriever` | Parallel fetch from selected sources; dedup; priority sort |
-| 6 | `response_generator` | Synthesise grounded answer from retrieved context |
-| 7 | `relevance_checker` | Score answer vs. context (not self-grading); loop if low |
+| 1 | `query_rewriter` | + conversation memory injection; + HyDE embedding on iteration 1 |
+| 2 | `query_decomposer` | Detect multi-hop; split compound questions |
+| 3 | `detail_checker` | Router: retrieval vs. parametric LLM |
+| 4 | `source_selector` | Agentic: `retrieval_plan` — ordered list of source steps |
+| 5 | `retriever` | Parallel multi-source fetch; passes `hyde_vec` to vector store |
+| 6 | `context_compressor` | **New** — LLM extraction + Jaccard dedup |
+| 7 | `response_generator` | Uses `compressed_context` (or raw if compression off) |
+| 8 | `relevance_checker` | + GuardrailsChecker; stores `groundedness_score`, `confidence_score` |
 
-Max retry loops: 5. On the 5th loop, `query_rewriter` simplifies the query to
-break out of low-relevance cycles.
+Max retry loops: 5. On loop, `query_rewriter` SIMPLIFIES (not expands) to break
+low-relevance cycles. Accepted answers are saved to conversation memory.
 
-**Entry point:**
+**New state fields (`EquityRAGState`):**
+
+| Field | Set by | Purpose |
+|---|---|---|
+| `session_id` | Caller | Links to ConversationStore session |
+| `hyde_embedding` | `query_rewriter` | Blended HyDE vector (float list) |
+| `compressed_context` | `context_compressor` | Post-compression chunks |
+| `groundedness_score` | `relevance_checker` | From GuardrailsChecker |
+| `confidence_score` | `relevance_checker` | Composite confidence |
+| `hallucinated_claims` | `relevance_checker` | Unsupported figures/dates |
+| `retrieval_plan` | `source_selector` | Ordered source list for agentic retrieval |
+
+**Entry points:**
 
 ```python
-from equity_research.retrieval.rag_pipeline import run
+from equity_research.retrieval.rag_pipeline import run, stream_run
 
+# Synchronous
 result = run(
-    question="What was APEX's FY2023 free cash flow?",
+    question="What was APEX's FY2023 FCF?",
     company_name="APEX Technologies",
     ticker="APEX",
+    session_id="analyst-session-1",   # optional; enables conversation memory
 )
-# result keys: final_response, sources_used, relevance_score, ...
+# result: final_response, sources_used, relevance_score,
+#         confidence_score, groundedness_score
+
+# Streaming (async generator — use inside FastAPI async endpoint)
+async for token in stream_run(question, company_name, ticker, session_id):
+    print(token, end="", flush=True)
 ```
 
-**`run()` validates LLM config before building the graph.** If no API key is set,
-it raises `RuntimeError` with setup instructions.
-
-### 7.3 LangChain tools (`retrieval/tools.py`)
+### 7.9 LangChain tools (`retrieval/tools.py`)
 
 | Tool | Function | Notes |
 |---|---|---|
@@ -546,19 +729,11 @@ it raises `RuntimeError` with setup instructions.
 
 **Calculator security (`_safe_eval`):**
 - Allowed nodes: `Num`, `BinOp` (+−×÷^), `UnaryOp`, `Call` (math functions only)
-- Blocks: string operands (`non-numeric operands not allowed`), exponents > 10,000
-  (prevents `9**387420489` DoS)
-- Blocked functions: all except `abs`, `round`, `min`, `max`, `sum`, `math.*`
+- Blocks: string operands, exponents > 10,000 (prevents `9**387420489` DoS)
 
 **Wikipedia gating (`_is_background_query`):**
-Frozenset check on 30+ keywords (`history`, `founded`, `overview`, `sector`,
-`headquarters`, etc.). Wikipedia is only called for clearly background queries —
-not for specific financial figures where it would hallucinate.
-
-**Graceful import:** Both `tools.py` and `rag_pipeline.py` wrap their
-`langchain_core` imports in `try/except`. If the package is absent, a no-op stub
-replaces the `@tool` decorator so the modules can be imported and tested without
-LLM dependencies installed.
+Frozenset check on 30+ keywords (`history`, `founded`, `overview`, `sector`, etc.).
+Wikipedia is only called for clearly background queries — not for financial figures.
 
 ---
 
@@ -581,7 +756,8 @@ uvicorn equity_research.api.server:app --host 0.0.0.0 --port 8000 --workers 2
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness + readiness check — LLM, embedding model, LangChain |
-| `POST` | `/query` | Run RAG pipeline; returns answer, sources, relevance score, latency |
+| `POST` | `/query` | Run full RAG pipeline (sync); returns answer, scores, latency |
+| `POST` | `/stream` | Stream response token-by-token via Server-Sent Events |
 | `POST` | `/ingest` | Ingest a document into a ticker's knowledge base |
 | `GET` | `/collection/{ticker}` | Chunk count for a ticker |
 | `DELETE` | `/collection/{ticker}` | Drop a ticker's knowledge base (irreversible) |
@@ -591,17 +767,44 @@ uvicorn equity_research.api.server:app --host 0.0.0.0 --port 8000 --workers 2
 **POST /query**
 ```json
 // Request
-{ "question": "What was APEX's FY2023 revenue?", "ticker": "APEX", "company_name": "APEX Technologies" }
+{
+  "question": "What was APEX's FY2023 revenue?",
+  "ticker": "APEX",
+  "company_name": "APEX Technologies",
+  "session_id": "analyst-session-1"   // optional; enables conversation memory
+}
 
 // Response
 {
   "question": "...", "ticker": "APEX",
   "answer": "APEX Technologies reported total revenue of $18.42 billion...",
-  "sources_used": ["APEX_10K_FY23_REV", ...],
+  "sources_used": ["vector_db", "sec_edgar"],
   "relevance_score": 0.94,
+  "confidence_score": 0.87,
+  "groundedness_score": 0.91,
   "latency_ms": 312.4
 }
 ```
+
+**POST /stream** — Server-Sent Events
+```json
+// Request (same shape as /query)
+{
+  "question": "Explain Apple gross margin trend",
+  "ticker": "AAPL",
+  "session_id": "s1"
+}
+```
+Response is `text/event-stream`. Each event carries one token:
+```
+data: Apple\n\n
+data: 's\n\n
+data:  gross\n\n
+...
+data: [DONE]\n\n
+```
+Newlines within tokens are escaped as `\n` so SSE framing is never broken.
+`X-Accel-Buffering: no` header is set to disable nginx proxy buffering.
 
 **POST /ingest**
 ```json
@@ -636,7 +839,7 @@ Token-bucket, in-memory, per source IP:
 ### Startup validation
 
 `@app.on_event("startup")` calls `validate_llm_config()` and `_ensure_settings()`
-(loads BGE-large). Both failures are logged but do not crash the process — instead,
+(loads BGE-small). Both failures are logged but do not crash the process — instead,
 `/health` returns 503 so orchestration systems can detect the misconfiguration.
 
 ---
@@ -775,9 +978,24 @@ chunks = query("What was APEX's gross margin?", ticker="APEX", top_k=5)
 ### RAG pipeline (Python)
 
 ```python
-from equity_research.retrieval.rag_pipeline import run
-result = run("What is APEX's FY2024 revenue guidance?", company_name="APEX", ticker="APEX")
+from equity_research.retrieval.rag_pipeline import run, stream_run
+
+# Synchronous
+result = run(
+    "What is APEX's FY2024 revenue guidance?",
+    company_name="APEX",
+    ticker="APEX",
+    session_id="analyst-1",   # optional; enables conversation memory
+)
 print(result["final_response"])
+print(f"confidence={result['confidence_score']:.2f}  grounded={result['groundedness_score']:.2f}")
+
+# Streaming (run inside an async context)
+import asyncio
+async def stream():
+    async for token in stream_run("Explain APEX margins", ticker="APEX", session_id="analyst-1"):
+        print(token, end="", flush=True)
+asyncio.run(stream())
 ```
 
 ### API server
@@ -788,10 +1006,15 @@ uvicorn equity_research.api.server:app --host 0.0.0.0 --port 8000 --workers 2
 # Health check
 curl http://localhost:8000/health
 
-# Query
+# Synchronous query (with session for conversation memory)
 curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
-  -d '{"question":"What is APEX revenue?","ticker":"APEX","company_name":"APEX"}'
+  -d '{"question":"What is APEX revenue?","ticker":"APEX","session_id":"s1"}'
+
+# Streaming query (SSE)
+curl -N -X POST http://localhost:8000/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Explain APEX gross margin trend","ticker":"APEX","session_id":"s1"}'
 ```
 
 ### Jupyter / Colab
@@ -867,16 +1090,19 @@ python -m equity_research.tests.rag_backtest
 
 | Model | Batch=1 | Batch=32 | Notes |
 |---|---|---|---|
-| `BAAI/bge-large-en-v1.5` | ~310 ms | ~310 ms | CPU-bound, GIL-serialised |
+| `BAAI/bge-small-en-v1.5` (default) | ~50 ms | ~30 ms | 384-dim, CPU-friendly |
 | `all-MiniLM-L6-v2` (fallback) | ~40 ms | ~15 ms | Faster, lower quality |
+
+BGE-small is ~6× faster than BGE-large with comparable financial-domain retrieval quality
+on the MRR metric. Multi-vector (child+parent) architecture recovers quality lost from
+the smaller model.
 
 ### Concurrency model
 
-- Embedding semaphore: `threading.Semaphore(min(cpu_count, 8))`
-- 5-minute query result cache prevents redundant encode+retrieve round-trips
-- Cache shows hit rate of ~40% in repeated-question workloads (seen in backtest logs)
-- P95 degrades at 10+ concurrent users on CPU; use GPU or reduce concurrency on
-  CPU-only deployments by lowering `_EMBED_CONCURRENCY`
+- FAISS `IndexFlatIP` is thread-safe for concurrent reads
+- Embedding is gated by `threading.Semaphore(min(cpu_count, 8))`
+- Per-ticker stores are isolated — concurrent queries to different tickers have no contention
+- Cache is in-process per worker (not shared across uvicorn workers — see Known Limitations)
 
 ### Full research run duration (approximate)
 
@@ -907,13 +1133,20 @@ The CE reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`) only runs when
 `len(candidates) > top_k`. For small corpora where candidates == top_k, it is
 intentionally skipped because the ms-marco model (trained on web-search passages)
 produced score inversions on dense financial text, hurting MRR. Enable by changing
-the gate to `>= 2` and test on your production corpus before deploying.
+the gate to `>= 2` and benchmark on your production corpus before deploying.
 
-### Cache is not shared across uvicorn workers
+### FAISS persistence is file-lock-free
 
-The `_query_cache` dict is in-process. With `--workers 2`, each worker has its own
-cache. Use Redis + LangChain cache middleware for shared cache in multi-worker
-deployments.
+FAISS indices are loaded into memory per process. With `--workers 2`, each worker
+loads its own copy. Concurrent writes from two workers to the same ticker's index
+files could corrupt them. If you need concurrent ingestion across workers, use a
+task queue (Celery, ARQ) to serialise writes, or deploy a single ingestion worker.
+
+### Conversation memory is in-process
+
+`ConversationStore` is a module-level singleton — not shared across uvicorn workers.
+A multi-turn session must be routed to the same worker (sticky sessions via nginx
+`ip_hash`) or migrated to a Redis-backed store for production multi-worker deploys.
 
 ### Windows CRLF line endings
 
@@ -958,8 +1191,10 @@ Use `PyMuPDF` (`fitz.open(path).get_text("text")`) for extraction.
   ```
   HF_TOKEN=your_hf_token_here
   ```
-- [ ] Pre-warm the BGE-large model by calling `_ensure_settings()` at startup
-  rather than on first query
+- [ ] Pre-warm BGE-small by calling `_ensure_settings()` at startup (the server
+  does this automatically via `@app.on_event("startup")`)
+- [ ] For multi-worker deploys: route streaming `/stream` requests via sticky session
+  (`nginx ip_hash`) to avoid mid-stream worker switches
 
 ### Security notes
 
@@ -1033,23 +1268,52 @@ Use `PyMuPDF` (`fitz.open(path).get_text("text")`) for extraction.
 
 ### Changing the embedding model
 
-Edit `core/config.py`:
+Edit `RAG_CONFIG` in `core/config.py` or override at runtime:
 ```python
-@dataclass
-class EmbeddingConfig:
-    model_name: str = "BAAI/bge-large-en-v1.5"   # ← change this
-    chunk_size: int = 512
-    chunk_overlap: int = 100
+from equity_research.core.config import RAG_CONFIG
+RAG_CONFIG.model_name = "BAAI/bge-base-en-v1.5"   # 768-dim, better quality
+RAG_CONFIG.fallback_model = "all-MiniLM-L6-v2"
 ```
 
-Clear existing ChromaDB collections after changing the model — embeddings
-from different models are incompatible:
+After changing the model, clear existing FAISS indices — embeddings from different
+models have incompatible dimensions and will cause a FAISS inner-product dimension error:
 ```python
 from equity_research.retrieval.vector_store import clear_company
-clear_company("TICKER")
+clear_company("TICKER")   # deletes data/faiss_index/<TICKER>/
+```
+
+To change chunk sizes (child/parent split), update `RAG_CONFIG.child_chunk_size`
+and `RAG_CONFIG.parent_chunk_size`, then re-ingest all documents.
+
+### Adding SSE streaming to a custom frontend
+
+Consume `POST /stream` with the browser `EventSource`-compatible fetch:
+```javascript
+const response = await fetch("/stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ question, ticker, session_id }),
+});
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  const lines = buffer.split("\n\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (line.startsWith("data: ")) {
+      const token = line.slice(6).replace(/\\n/g, "\n");
+      if (token === "[DONE]") return;
+      appendToUI(token);
+    }
+  }
+}
 ```
 
 ---
 
-*Document updated: 2026-06-17. Maintained in `docs/TECHNICAL_REFERENCE.md`.*
-*Current commit: `3fa8c0b`. Platform repo: https://github.com/anubhav0499-bit/equity-research*
+*Document updated: 2026-06-18. Maintained in `docs/TECHNICAL_REFERENCE.md`.*
+*Current commit: `fbb6d4d`. Platform repo: https://github.com/anubhav0499-bit/equity-research*

@@ -86,6 +86,30 @@ python main.py --check
 python main.py --batch companies.txt --output ./reports
 ```
 
+### RAG query API
+
+Ask analyst questions grounded on ingested filings — independently of the research pipeline:
+
+```bash
+# Start the API server
+uvicorn equity_research.api.server:app --host 0.0.0.0 --port 8000
+
+# Ingest a document
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"ticker":"AAPL","text":"<filing text>","metadata":{"doc_type":"10-K"}}'
+
+# Synchronous query
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What was Apple FY2024 revenue?","ticker":"AAPL","session_id":"s1"}'
+
+# Streaming query (Server-Sent Events)
+curl -X POST http://localhost:8000/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Explain Apple gross margin trend","ticker":"AAPL","session_id":"s1"}'
+```
+
 ## Notebook
 
 `quickstart.ipynb` runs the full pipeline in any Jupyter environment:
@@ -175,11 +199,27 @@ equity_research/
 │   ├── management_governance.py  # 18  (governance score, promoter pledging, RPT analysis)
 │   └── esg_sustainability.py     # 19  (BRSR + ISSB/SASB/GRI/TCFD frameworks)
 ├── core/
-│   ├── config.py                 # all config + env var loading
+│   ├── config.py                 # all config + env var loading (incl. RAGConfig)
 │   ├── llm_manager.py            # multi-provider LLM interface
 │   ├── logging_setup.py
 │   └── research_philosophy.py    # CIO research philosophy — 11-step sequence, agent specs,
 │                                 #   RAG document tag schema, source priority, evidence rules
+├── retrieval/
+│   ├── vector_store.py           # FAISS IndexFlatIP, child(256)+parent(1024) multi-vector,
+│   │                             #   BM25+RRF+cross-encoder, persistence at data/faiss_index/
+│   ├── rag_pipeline.py           # 9-node LangGraph pipeline (HyDE, compression, guardrails,
+│   │                             #   conversation memory, SSE streaming)
+│   ├── chunking.py               # SmartChunker — recursive / contextual / semantic strategies
+│   ├── hyde.py                   # HyDE — hypothetical doc embedding blended with query
+│   ├── compression.py            # ContextCompressor — keyword filter + LLM extraction + dedup
+│   ├── memory.py                 # ConversationStore — session-keyed sliding window + LLM summary
+│   ├── guardrails.py             # GuardrailsChecker — rule-based + LLM faithfulness + confidence
+│   ├── evaluation.py             # RAGASEvaluator — context_relevance, faithfulness, answer_relevance
+│   ├── tools.py                  # LangChain tools: SEC EDGAR, web search, Wikipedia, calculator
+│   └── ingest.py                 # Document ingestion helpers
+├── api/
+│   ├── __init__.py
+│   └── server.py                 # FastAPI — /query, /stream (SSE), /ingest, /health
 ├── forensics/
 │   ├── beneish.py                # 8-variable Beneish M-Score
 │   ├── piotroski.py              # 9-signal F-Score
