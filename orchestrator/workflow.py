@@ -1,11 +1,21 @@
 """
-Research Orchestrator — coordinates all 17 agents in a phased workflow.
-Phase A: Profiling + Filing Retrieval (sequential)
-Phase B: Extraction + Market Data (parallel)
-Phase C: Analysis agents (parallel)
-Phase D: Modeling + Valuation (sequential, uses Phase C output)
-Phase E: Narrative + Compliance (sequential)
-Phase F: Report Generation
+CIO-Orchestrated Equity Research Workflow — 20-agent platform.
+
+The orchestrator acts as Chief Investment Officer (CIO): it coordinates
+specialist agents, validates evidence quality, resolves contradictions,
+and generates the final investment recommendation.
+
+Research sequence follows the mandatory 11-step philosophy:
+  1 Macro → 2 Industry → 3 Business → 4 Management → 5 Financial →
+  6 Risks → 7 Accounting → 8 Governance → 9 Forecast → 10 Valuation → 11 Thesis
+
+Phase A: Company Profiling + Filing Retrieval (sequential)
+Phase B: Financial Extraction + Market Data + Transcripts + Historical (parallel)
+Phase C: Analysis agents — Accounting, Forensic, Risk, Earnings, Industry Intelligence,
+         Management Governance, ESG Sustainability (parallel)
+Phase D: Financial Modeling → Valuation → Scenario Analysis (sequential)
+Phase E: Narrative Generation → Compliance & Standards Validation (sequential)
+Phase F: Report Generation (20-section CIO report)
 """
 
 from __future__ import annotations
@@ -41,6 +51,9 @@ from ..agents.historical_data import HistoricalDataAgent
 from ..agents.earnings_quality import EarningsQualityAgent
 from ..agents.scenario_analysis import ScenarioAnalysisAgent
 from ..agents.report_generation import ReportGenerationAgent
+from ..agents.industry_intelligence import IndustryIntelligenceAgent
+from ..agents.management_governance import ManagementGovernanceAgent
+from ..agents.esg_sustainability import ESGSustainabilityAgent
 
 
 def _supports_parallel(llm: LLMManager) -> bool:
@@ -117,12 +130,21 @@ class ResearchOrchestrator:
                     state.financial_history = output.payload.get("financial_history")
 
             # ── Phase C: Analysis agents (parallel) ───────────────
-            logger.info("Phase C: Accounting Quality + Forensic + Risk + Earnings Quality")
+            # Sequence steps 2, 4, 6, 7, 8, 9 run in parallel after data is gathered.
+            # Industry Intelligence (step 2), Management Governance (step 4), and
+            # ESG Sustainability (step 8) are the new CIO framework agents.
+            logger.info(
+                "Phase C: Accounting Quality + Forensic + Risk + Earnings Quality + "
+                "Industry Intelligence + Management Governance + ESG Sustainability"
+            )
             phase_c_agents = [
-                (AccountingQualityAgent, "05_accounting_quality"),
-                (ForensicAccountingAgent, "06_forensic_accounting"),
-                (RiskAnalysisAgent, "09_risk_analysis"),
-                (EarningsQualityAgent, "14_earnings_quality"),
+                (AccountingQualityAgent,       "05_accounting_quality"),
+                (ForensicAccountingAgent,      "06_forensic_accounting"),
+                (RiskAnalysisAgent,            "09_risk_analysis"),
+                (EarningsQualityAgent,         "14_earnings_quality"),
+                (IndustryIntelligenceAgent,    "17_industry_intelligence"),
+                (ManagementGovernanceAgent,    "18_management_governance"),
+                (ESGSustainabilityAgent,       "19_esg_sustainability"),
             ]
             phase_c_results = self._run_parallel(phase_c_agents, state, storage, audit)
             for output in phase_c_results:
@@ -236,16 +258,20 @@ class ResearchOrchestrator:
     # ── Risk scoring ──────────────────────────────────────────────
 
     def _compute_overall_risk(self, state: ResearchState) -> float:
+        # CIO risk weight matrix — forensic + accounting are highest conviction signals.
+        # New agents (industry, governance, ESG) contribute to overall risk composite.
         weights = {
-            "06_forensic_accounting": 0.20,
-            "05_accounting_quality": 0.15,
-            "09_risk_analysis": 0.15,
-            "14_earnings_quality": 0.12,
-            "08_valuation": 0.10,
-            "03_financial_extraction": 0.08,
-            "07_financial_modeling": 0.08,
-            "13_historical_data": 0.07,
-            "11_compliance": 0.05,
+            "06_forensic_accounting":   0.18,
+            "05_accounting_quality":    0.13,
+            "09_risk_analysis":         0.13,
+            "14_earnings_quality":      0.10,
+            "18_management_governance": 0.10,  # new: governance risk
+            "08_valuation":             0.09,
+            "17_industry_intelligence": 0.08,  # new: industry structural risk
+            "03_financial_extraction":  0.07,
+            "19_esg_sustainability":    0.05,  # new: ESG/climate risk
+            "07_financial_modeling":    0.04,
+            "11_compliance":            0.03,
         }
         score = 0.0
         total_weight = 0.0

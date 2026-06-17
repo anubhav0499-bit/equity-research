@@ -1,6 +1,11 @@
 """
 Research workflow state and agent output schemas.
 Every agent returns an AgentOutput; the orchestrator accumulates them into ResearchState.
+
+Includes:
+- SourceType / EvidenceLevel: RAG retrieval framework (§ Evidence Validation)
+- DocumentTag: Required metadata for every retrieved document (§ RAG Retrieval Framework)
+- ThesisComponent: Bull / Base / Bear case structure (§ Thesis Construction Agent)
 """
 
 from __future__ import annotations
@@ -14,6 +19,64 @@ class RiskClassification(str, Enum):
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
+
+
+# ── RAG Retrieval & Evidence Validation ──────────────────────────────────────
+
+class SourceType(str, Enum):
+    """Source priority per the RAG Retrieval Framework."""
+    PRIMARY = "PRIMARY"      # Annual reports, earnings calls, regulatory filings
+    SECONDARY = "SECONDARY"  # Broker reports, rating agency reports
+    TERTIARY = "TERTIARY"    # News, expert commentary
+
+
+class EvidenceLevel(str, Enum):
+    """Confidence tier based on number of independent sources."""
+    HIGH = "HIGH"      # 3+ independent sources
+    MEDIUM = "MEDIUM"  # 2 independent sources
+    LOW = "LOW"        # Single source — must be flagged
+
+
+class DocumentTag(BaseModel):
+    """Required metadata tag for every document retrieved by the RAG pipeline."""
+    jurisdiction: str = ""          # "India", "US", "UK", "Global"
+    standard: str = ""              # "Ind AS", "IFRS", "US GAAP", "BRSR", "SEBI"
+    sector: str = ""                # "Banking", "Technology", etc.
+    industry: str = ""              # Sub-sector
+    doc_type: str = ""              # "10-K", "Annual Report", "Earnings Call", etc.
+    filing_year: str = ""           # "FY2024"
+    materiality: str = "MEDIUM"     # "HIGH" / "MEDIUM" / "LOW"
+    source_reliability: str = "MEDIUM"  # "HIGH" / "MEDIUM" / "LOW"
+    confidence_score: float = Field(0.5, ge=0.0, le=1.0)
+    source_type: SourceType = SourceType.SECONDARY
+    model_config = {"frozen": True}
+
+
+# ── Thesis Components ─────────────────────────────────────────────────────────
+
+class ThesisCase(BaseModel):
+    """One scenario (bull / base / bear) of the investment thesis."""
+    scenario: str               # "BULL" / "BASE" / "BEAR"
+    narrative: str
+    target_price: Optional[float] = None
+    return_potential_pct: Optional[float] = None
+    key_assumptions: list[str] = Field(default_factory=list)
+    probability: Optional[float] = Field(None, ge=0.0, le=1.0)
+    model_config = {"frozen": True}
+
+
+class ThesisComponent(BaseModel):
+    """Full investment thesis from the Thesis Construction Agent."""
+    variant_perception: str = ""  # What market believes vs. what we believe
+    consensus_view: str = ""
+    our_view: str = ""
+    why_consensus_is_wrong: str = ""
+    catalysts: list[str] = Field(default_factory=list)
+    key_risks: list[str] = Field(default_factory=list)
+    bull_case: Optional[ThesisCase] = None
+    base_case: Optional[ThesisCase] = None
+    bear_case: Optional[ThesisCase] = None
+    model_config = {"frozen": True}
 
 
 class AgentStatus(str, Enum):
@@ -43,6 +106,10 @@ class Finding(BaseModel):
     risk_level: RiskClassification = RiskClassification.MEDIUM
     confidence: float = Field(..., ge=0.0, le=1.0)
     quantified_impact: Optional[float] = None
+    # RAG evidence provenance
+    source_type: SourceType = SourceType.SECONDARY
+    evidence_level: EvidenceLevel = EvidenceLevel.MEDIUM
+    jurisdiction: str = ""
     model_config = {"frozen": True}
 
 
@@ -153,6 +220,7 @@ class ResearchState(BaseModel):
     # Report artifacts
     report_sections: dict[str, str] = Field(default_factory=dict)
     report_path: Optional[str] = None
+    thesis: Optional[ThesisComponent] = None  # Populated by ThesisConstructionAgent / NarrativeAgent
 
     # Workflow control
     current_agent: Optional[str] = None
