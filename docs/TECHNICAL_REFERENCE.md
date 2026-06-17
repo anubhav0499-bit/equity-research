@@ -385,20 +385,33 @@ Phase F
 
 ### Risk weight matrix (Phase C → `overall_risk_score`)
 
-| Agent | Weight |
-|---|---|
-| ForensicAccounting | 0.18 |
-| AccountingQuality | 0.13 |
-| RiskAnalysis | 0.13 |
-| EarningsQuality | 0.10 |
-| ManagementGovernance | 0.10 |
-| Valuation | 0.09 |
-| IndustryIntelligence | 0.08 |
-| FinancialExtraction | 0.07 |
-| ESGSustainability | 0.05 |
-| FinancialModeling | 0.04 |
-| Compliance | 0.03 |
-| **Total** | **1.00** |
+Aligned with CFA Institute Research Objectivity Standards, OECD Corporate Governance
+Principles (2023), and the MSCI Quality Factor. Three design principles drive the
+rebalancing vs. an equal-weight starting point:
+
+1. **Governance first.** Every major factor-model study finds governance the strongest
+   single predictor of long-run risk-adjusted returns. It was chronically underweighted
+   in traditional sell-side frameworks.
+2. **Industry structure second.** Porter Five Forces and competitive moat determine the
+   durability of cash flows — the source of all equity value. Systematically underweighted
+   in models that focus on trailing accounting ratios.
+3. **Process signals minimal.** Financial modeling and data extraction are analyst outputs
+   and completeness checks, not independent risk signals; they receive near-zero weight.
+
+| Agent | Weight | Key signals |
+|---|---|---|
+| ManagementGovernance | **0.20** | Board independence, RPT exposure, promoter pledging, capital allocation track record |
+| ForensicAccounting | **0.15** | Beneish M-score, Altman Z-score, Piotroski F-score, accrual anomalies |
+| RiskAnalysis | **0.13** | Macro / credit / operational risk matrix |
+| IndustryIntelligence | **0.12** | Porter Five Forces, TAM, moat durability, competitive intensity |
+| AccountingQuality | **0.10** | Accrual ratio, revenue recognition quality, DSRI / GMI |
+| EarningsQuality | **0.08** | Guidance accuracy, beat/miss streaks, earnings revision bias |
+| Valuation | **0.08** | DCF / relative multiple risk (paying too much) |
+| ESGSustainability | **0.07** | ISSB S1+S2, BRSR; material for energy, materials, utilities |
+| FinancialExtraction | **0.04** | Data completeness / quality check |
+| Compliance | **0.02** | Regulatory pass/fail; upstream signal captured by governance |
+| FinancialModeling | **0.01** | 5-yr model accuracy; analyst output, not independent signal |
+| **Total** | **1.00** | |
 
 ### Agent contract (`base_agent.py`)
 

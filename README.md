@@ -20,19 +20,21 @@ Each agent returns a typed `AgentOutput` (Pydantic). No free-form text passes be
 
 ### Risk weight matrix (Phase C → overall risk score)
 
-| Agent | Weight |
-|-------|--------|
-| Forensic Accounting | 18% |
-| Accounting Quality | 13% |
-| Risk Analysis | 13% |
-| Earnings Quality | 10% |
-| Management & Governance | 10% |
-| Valuation | 9% |
-| Industry Intelligence | 8% |
-| Financial Extraction | 7% |
-| ESG & Sustainability | 5% |
-| Financial Modeling | 4% |
-| Compliance Validation | 3% |
+Weights are aligned with CFA Institute, OECD Corporate Governance Principles, and MSCI Quality Factor research.
+
+| Agent | Weight | Primary rationale |
+|-------|--------|-------------------|
+| Management & Governance | 20% | Strongest predictor of long-run risk-adjusted return (OECD, Fama-French quality factor) |
+| Forensic Accounting | 15% | Beneish/Altman/Piotroski: best early-warning for catastrophic downside |
+| Risk Analysis | 13% | Macro / credit / operational risk anchor |
+| Industry Intelligence | 12% | Porter Five Forces + moat: structural driver of cash-flow durability |
+| Accounting Quality | 10% | Accrual ratio, revenue recognition; MSCI quality factor component |
+| Earnings Quality | 8% | Guidance accuracy, beat/miss patterns; predictability premium |
+| Valuation | 8% | Valuation risk (secondary to business quality signals) |
+| ESG & Sustainability | 7% | ISSB S1+S2 / BRSR: material for energy, materials, utilities |
+| Financial Extraction | 4% | Data completeness check; not a fundamental risk driver |
+| Compliance Validation | 2% | Largely binary pass/fail; captured upstream by governance weight |
+| Financial Modeling | 1% | 5-yr model output — analyst assumption, not independent risk signal |
 
 ## Forensic Checks
 

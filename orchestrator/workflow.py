@@ -258,20 +258,41 @@ class ResearchOrchestrator:
     # ── Risk scoring ──────────────────────────────────────────────
 
     def _compute_overall_risk(self, state: ResearchState) -> float:
-        # CIO risk weight matrix — forensic + accounting are highest conviction signals.
-        # New agents (industry, governance, ESG) contribute to overall risk composite.
+        # CIO risk weight matrix — aligned with CFA Institute, OECD Corporate Governance
+        # Principles, and MSCI Quality Factor research.
+        #
+        # Key design principles:
+        #   1. Governance is the single strongest predictor of long-term risk-adjusted return
+        #      (OECD 2023, Fama-French quality factor, Buffett's "first filter").
+        #   2. Industry structure (Porter + TAM) determines the durability of cash flows;
+        #      systematically underweighted in traditional models.
+        #   3. Forensic signals remain high — the best early-warning for catastrophic downside.
+        #   4. Financial modeling and data extraction are analyst outputs / process checks,
+        #      not independent risk signals; they receive minimal weight.
+        #   5. ESG raised to 7%: ISSB S1+S2 mandate makes climate/social risk financially
+        #      material and auditable from FY2025 onwards.
         weights = {
-            "06_forensic_accounting":   0.18,
-            "05_accounting_quality":    0.13,
-            "09_risk_analysis":         0.13,
-            "14_earnings_quality":      0.10,
-            "18_management_governance": 0.10,  # new: governance risk
-            "08_valuation":             0.09,
-            "17_industry_intelligence": 0.08,  # new: industry structural risk
-            "03_financial_extraction":  0.07,
-            "19_esg_sustainability":    0.05,  # new: ESG/climate risk
-            "07_financial_modeling":    0.04,
-            "11_compliance":            0.03,
+            "18_management_governance": 0.20,  # governance quality: board independence,
+                                               # capital allocation, RPT exposure, pledging
+            "06_forensic_accounting":   0.15,  # Beneish/Altman/Piotroski: highest pure
+                                               # downside signal; fraud/manipulation early-warning
+            "09_risk_analysis":         0.13,  # macro / credit / operational risk matrix
+            "17_industry_intelligence": 0.12,  # Porter Five Forces, TAM, moat durability;
+                                               # structural driver of long-run cash flows
+            "05_accounting_quality":    0.10,  # accrual ratio, revenue recognition quality;
+                                               # MSCI quality factor component
+            "14_earnings_quality":      0.08,  # guidance accuracy, beat/miss patterns;
+                                               # earnings predictability premium
+            "08_valuation":             0.08,  # valuation risk (paying too much);
+                                               # secondary to business quality signals
+            "19_esg_sustainability":    0.07,  # ISSB S1+S2 / BRSR: material for energy,
+                                               # materials, utilities, and large-cap India cos
+            "03_financial_extraction":  0.04,  # data quality / completeness signal;
+                                               # not a fundamental risk driver
+            "11_compliance":            0.02,  # regulatory risk: largely binary pass/fail;
+                                               # captured upstream by governance weight
+            "07_financial_modeling":    0.01,  # 5-yr model accuracy: analyst output,
+                                               # not an independent risk signal
         }
         score = 0.0
         total_weight = 0.0
