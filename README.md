@@ -4,18 +4,35 @@ Autonomous institutional-grade equity research system. Given a company name or t
 
 ## Architecture
 
-17 agents run in a phased pipeline:
+20 agents run in a CIO-orchestrated phased pipeline. The research philosophy — mandatory 11-step sequence, agent specifications, RAG document tagging schema, and evidence rules — is encoded in `core/research_philosophy.py` and imported by all agents.
 
 ```
 Phase A  Company Profiling → Filing Retrieval
-Phase B  Financial Extraction + Market Data + Transcript Retrieval + Historical Data  (parallel)
-Phase C  Accounting Quality + Earnings Quality + Forensic Accounting + Risk Analysis  (parallel)
+Phase B  Financial Extraction + Market Data + Transcript Retrieval + Historical Data       (parallel)
+Phase C  Accounting Quality + Earnings Quality + Forensic Accounting + Risk Analysis
+         + Industry Intelligence + Management & Governance + ESG & Sustainability          (parallel)
 Phase D  Financial Modeling → Valuation → Scenario Analysis  (sequential)
-Phase E  Narrative Generation → Compliance Validation  (sequential)
+Phase E  Narrative Generation (+ Thesis Construction) → Compliance Validation  (sequential)
 Phase F  Report Generation
 ```
 
 Each agent returns a typed `AgentOutput` (Pydantic). No free-form text passes between agents. Full audit trail is written to JSONL.
+
+### Risk weight matrix (Phase C → overall risk score)
+
+| Agent | Weight |
+|-------|--------|
+| Forensic Accounting | 18% |
+| Accounting Quality | 13% |
+| Risk Analysis | 13% |
+| Earnings Quality | 10% |
+| Management & Governance | 10% |
+| Valuation | 9% |
+| Industry Intelligence | 8% |
+| Financial Extraction | 7% |
+| ESG & Sustainability | 5% |
+| Financial Modeling | 4% |
+| Compliance Validation | 3% |
 
 ## Forensic Checks
 
@@ -136,28 +153,33 @@ Each run creates:
 
 ```
 equity_research/
-├── agents/               # 17 agent implementations
-│   ├── base_agent.py
+├── agents/               # 20 agent implementations
+│   ├── base_agent.py             # abstract base — retry, audit, _latest_fin helper
 │   ├── company_profiling.py      # 01
 │   ├── filing_retrieval.py       # 02
 │   ├── financial_extraction.py   # 03
 │   ├── market_data.py            # 04
 │   ├── accounting_quality.py     # 05
-│   ├── forensic_accounting.py    # 06
+│   ├── forensic_accounting.py    # 06  (9 frameworks + historical fraud corpus)
 │   ├── financial_modeling_agent.py # 07
 │   ├── valuation_agent.py        # 08
 │   ├── risk_analysis.py          # 09
-│   ├── narrative_agent.py        # 10
-│   ├── compliance_agent.py       # 11
+│   ├── narrative_agent.py        # 10  (ThesisComponent + variant perception)
+│   ├── compliance_agent.py       # 11  (17 checks: Indian SEBI/LODR/IndAS + Global IFRS/IOSCO/ISSB)
 │   ├── transcript_retrieval.py   # 12
 │   ├── historical_data.py        # 13
 │   ├── earnings_quality.py       # 14
 │   ├── scenario_analysis.py      # 15
-│   └── report_generation.py      # 17
+│   ├── report_generation.py      # 16
+│   ├── industry_intelligence.py  # 17  (Porter Five Forces, TAM, attractiveness score)
+│   ├── management_governance.py  # 18  (governance score, promoter pledging, RPT analysis)
+│   └── esg_sustainability.py     # 19  (BRSR + ISSB/SASB/GRI/TCFD frameworks)
 ├── core/
 │   ├── config.py                 # all config + env var loading
 │   ├── llm_manager.py            # multi-provider LLM interface
-│   └── logging_setup.py
+│   ├── logging_setup.py
+│   └── research_philosophy.py    # CIO research philosophy — 11-step sequence, agent specs,
+│                                 #   RAG document tag schema, source priority, evidence rules
 ├── forensics/
 │   ├── beneish.py                # 8-variable Beneish M-Score
 │   ├── piotroski.py              # 9-signal F-Score
@@ -169,7 +191,8 @@ equity_research/
 │   ├── company.py                # CompanyProfile (frozen)
 │   ├── financials.py             # IS, BS, CFS, FinancialHistory
 │   ├── valuation.py              # WACC, DCF, Relative, SOTP, Scenarios
-│   ├── research.py               # AgentOutput, ResearchState, Finding
+│   ├── research.py               # AgentOutput, ResearchState, Finding, ThesisComponent,
+│   │                             #   ThesisCase, DocumentTag, SourceType, EvidenceLevel
 │   └── report.py                 # InstitutionalReport, SectionType
 ├── orchestrator/
 │   └── workflow.py               # ResearchOrchestrator — 6-phase pipeline

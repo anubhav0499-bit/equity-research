@@ -1,7 +1,7 @@
 # Equity Intelligence Research Platform — Technical Reference
 
 > **Handover document.** Covers architecture, configuration, data flow, deployment,
-> testing, and extension points. Written against commit `2d39a7b` (2026-06-17).
+> testing, and extension points. Written against commit `3fa8c0b` (2026-06-17).
 
 ---
 
@@ -37,13 +37,15 @@ DOCX report — without human intervention.
 
 | Dimension | Value |
 |---|---|
-| Agents | 17 |
+| Agents | 20 |
 | Orchestration phases | 6 (A–F) |
+| Research sequence steps | 11 (macro → industry → business → management → financial → risks → accounting → governance → forecast → valuation → thesis) |
 | RAG pipeline nodes | 7 (LangGraph) |
 | Embedding model | `BAAI/bge-large-en-v1.5` (1024-dim) |
 | Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | Vector DB | ChromaDB (per-ticker persistent collections) |
 | LLM providers supported | OpenAI, Anthropic, Groq, Gemini, Together, OpenRouter, Ollama |
+| Compliance checks | 17 (7 Indian standards + 10 global standards) |
 | Backtest score | 92.7 / 100 (MRR 0.976, Security 100/100, Scalability 96/100) |
 
 ---
@@ -60,10 +62,13 @@ equity_research/
 ├── core/
 │   ├── config.py               All typed settings, validate_llm_config()
 │   ├── llm_manager.py          Provider-agnostic LLM wrapper
-│   └── logging_setup.py        Loguru configuration
+│   ├── logging_setup.py        Loguru configuration
+│   └── research_philosophy.py  CIO research philosophy — RESEARCH_SEQUENCE (11 steps),
+│                               AGENT_SPECS (20 agents), RAG_DOCUMENT_TAG_FIELDS,
+│                               SOURCE_PRIORITY, EVIDENCE_RULES, REPORT_SECTIONS_20
 │
-├── agents/                     17 individual research agents
-│   ├── base_agent.py           Abstract base — retry, audit, timing
+├── agents/                     20 individual research agents
+│   ├── base_agent.py           Abstract base — retry, audit, timing, _latest_fin()
 │   ├── company_profiling.py    Phase A  — ticker resolution, sector, exchange
 │   ├── filing_retrieval.py     Phase A2 — SEC EDGAR / BSE / NSE filings
 │   ├── financial_extraction.py Phase B  — P&L, balance sheet, cash flow (5-yr)
@@ -71,15 +76,23 @@ equity_research/
 │   ├── transcript_retrieval.py Phase B  — earnings call transcripts
 │   ├── historical_data.py      Phase B  — 7-year price & volume history
 │   ├── accounting_quality.py   Phase C  — accruals, revenue quality
-│   ├── forensic_accounting.py  Phase C  — Beneish M-score, Altman Z, Piotroski
+│   ├── forensic_accounting.py  Phase C  — Beneish M-score, Altman Z, Piotroski;
+│   │                                      9 frameworks + 10-case fraud learning corpus
 │   ├── risk_analysis.py        Phase C  — macro/credit/operational risks
 │   ├── earnings_quality.py     Phase C  — beat/miss patterns, guidance quality
-│   ├── financial_modeling_agent.py  Phase D — 5-yr income/FCF model
+│   ├── industry_intelligence.py Phase C — Porter Five Forces, TAM, attractiveness score
+│   ├── management_governance.py Phase C — governance/credibility/capital-allocation scores,
+│   │                                      board independence, promoter pledging, RPT analysis
+│   ├── esg_sustainability.py   Phase C  — BRSR (India) + ISSB/SASB/GRI/TCFD (Global)
+│   ├── financial_modeling_agent.py Phase D — 5-yr income/FCF model
 │   ├── valuation_agent.py      Phase D  — DCF, EV/EBITDA, P/E band comps
 │   ├── scenario_analysis.py    Phase D  — bull/base/bear scenarios
-│   ├── narrative_agent.py      Phase E  — structured report sections (25 k words)
-│   ├── compliance_agent.py     Phase E  — disclaimer, data-source validation
-│   └── report_generation.py   Phase F  — DOCX assembly, charts, formatting
+│   ├── narrative_agent.py      Phase E  — ThesisComponent + variant perception +
+│   │                                      structured report sections (~25 000 words)
+│   ├── compliance_agent.py     Phase E  — 17 checks: SEBI RA Regs, LODR, Companies Act
+│   │                                      2013, Ind AS, IFRS, IOSCO, CFA, OECD,
+│   │                                      ISSB S1+S2, SASB, GRI (jurisdiction-gated)
+│   └── report_generation.py    Phase F  — DOCX assembly, charts, formatting
 │
 ├── orchestrator/
 │   ├── workflow.py             ResearchOrchestrator — phase A–F coordination
@@ -118,7 +131,9 @@ equity_research/
 │   └── docx_generator.py       python-docx DOCX builder with charts
 │
 ├── models/
-│   ├── research.py             ResearchState, AgentOutput, AgentStatus
+│   ├── research.py             ResearchState, AgentOutput, AgentStatus, Finding,
+│   │                           ThesisComponent (frozen), ThesisCase (frozen),
+│   │                           DocumentTag, SourceType, EvidenceLevel
 │   ├── company.py              CompanyProfile
 │   ├── financials.py           FinancialHistory, FinancialPeriod
 │   ├── valuation.py            ValuationSummary, ScenarioSet
@@ -275,39 +290,66 @@ Override model names in `config.yaml` under `llm.primary_model` / `llm.fast_mode
 
 ---
 
-## 6. 17-Agent Pipeline
+## 6. 20-Agent CIO Pipeline
+
+Research follows an 11-step mandatory sequence encoded in `core/research_philosophy.py`:
+macro → industry → business → management → financial → risks → accounting → governance → forecast → valuation → thesis.
+The orchestrator acts as CIO: it coordinates agents and aggregates risk scores; it does not analyze directly.
 
 ### Orchestration phases
 
 ```
 Phase A  (sequential)
-  01 CompanyProfilingAgent     — ticker, sector, exchange, CIK, Bloomberg ID
-  02 FilingRetrievalAgent      — SEC EDGAR 10-K/10-Q/8-K; BSE/NSE for Indian cos.
+  01 CompanyProfilingAgent      — ticker, sector, exchange, CIK, Bloomberg ID
+  02 FilingRetrievalAgent       — SEC EDGAR 10-K/10-Q/8-K; BSE/NSE for Indian cos.
 
 Phase B  (parallel, 4 agents)
-  03 FinancialExtractionAgent  — P&L, balance sheet, cash flow (5 yrs, GAAP/IFRS)
-  04 MarketDataAgent           — live price, market cap, P/E, 52-wk range (yfinance)
-  12 TranscriptRetrievalAgent  — last 4 earnings call transcripts
-  13 HistoricalDataAgent       — 7-year daily OHLCV, beta, correlations
+  03 FinancialExtractionAgent   — P&L, balance sheet, cash flow (5 yrs, GAAP/IFRS)
+  04 MarketDataAgent            — live price, market cap, P/E, 52-wk range (yfinance)
+  12 TranscriptRetrievalAgent   — last 4 earnings call transcripts
+  13 HistoricalDataAgent        — 7-year daily OHLCV, beta, correlations
 
-Phase C  (parallel, 4 agents)
-  05 AccountingQualityAgent    — revenue recognition, accrual ratio, DSRI, GMI
-  06 ForensicAccountingAgent   — Beneish M-score, Altman Z, Piotroski F
-  09 RiskAnalysisAgent         — macro/credit/operational risk matrix
-  14 EarningsQualityAgent      — EPS beat/miss streaks, guidance revision bias
+Phase C  (parallel, 7 agents)
+  05 AccountingQualityAgent     — revenue recognition, accrual ratio, DSRI, GMI
+  06 ForensicAccountingAgent    — Beneish M-score, Altman Z, Piotroski F;
+                                   9 frameworks + 10-case fraud learning corpus
+  09 RiskAnalysisAgent          — macro/credit/operational risk matrix
+  14 EarningsQualityAgent       — EPS beat/miss streaks, guidance revision bias
+  17 IndustryIntelligenceAgent  — Porter Five Forces, TAM, attractiveness score
+  18 ManagementGovernanceAgent  — governance/credibility/capital-allocation scores,
+                                   board independence, promoter pledging, RPT analysis
+  19 ESGSustainabilityAgent     — BRSR (India) + ISSB S1+S2 / SASB / GRI / TCFD (Global)
 
 Phase D  (sequential)
-  07 FinancialModelingAgent    — 5-yr P&L, FCF, revenue/margin drivers
-  08 ValuationAgent            — DCF + EV/EBITDA comps + P/E band → target price
-  15 ScenarioAnalysisAgent     — bull/base/bear outcomes with probability weights
+  07 FinancialModelingAgent     — 5-yr P&L, FCF, revenue/margin drivers
+  08 ValuationAgent             — DCF + EV/EBITDA comps + P/E band → target price
+  15 ScenarioAnalysisAgent      — bull/base/bear outcomes with probability weights
 
 Phase E  (sequential)
-  10 NarrativeGenerationAgent  — 25 structured report sections (~25 000 words)
-  11 ComplianceValidationAgent — disclaimer, source citations, data-quality flags
+  10 NarrativeGenerationAgent   — ThesisComponent (variant perception + Bull/Base/Bear
+                                   scenarios) + ~25 000-word structured report
+  11 ComplianceValidationAgent  — 17 checks across Indian + Global regulatory standards
 
 Phase F
-  16 ReportGenerationAgent     — DOCX assembly, charts, executive summary, cover page
+  16 ReportGenerationAgent      — DOCX assembly, charts, executive summary, cover page
 ```
+
+### Risk weight matrix (Phase C → `overall_risk_score`)
+
+| Agent | Weight |
+|---|---|
+| ForensicAccounting | 0.18 |
+| AccountingQuality | 0.13 |
+| RiskAnalysis | 0.13 |
+| EarningsQuality | 0.10 |
+| ManagementGovernance | 0.10 |
+| Valuation | 0.09 |
+| IndustryIntelligence | 0.08 |
+| FinancialExtraction | 0.07 |
+| ESGSustainability | 0.05 |
+| FinancialModeling | 0.04 |
+| Compliance | 0.03 |
+| **Total** | **1.00** |
 
 ### Agent contract (`base_agent.py`)
 
@@ -322,6 +364,18 @@ Every agent inherits `BaseAgent` and must:
 - Audit trail events (`audit_trail.py`)
 - Automatic retry (3 attempts, 2-second backoff)
 - Database run-status updates (`database.py`)
+
+**Shared helpers available to every agent:**
+
+| Helper | Signature | Purpose |
+|---|---|---|
+| `make_finding` | `(type, title, detail, evidence, risk_level, confidence, …)` | Create a typed `Finding` |
+| `red_flag` | `(title, detail, evidence, risk_level, **kwargs)` | Shorthand for `FindingType.RED_FLAG` |
+| `green_flag` | `(title, detail, evidence, confidence, **kwargs)` | Shorthand for `FindingType.GREEN_FLAG` |
+| `llm_analyze` | `(system_prompt, user_prompt, max_tokens, json_mode)` | LLM call via `LLMManager` |
+| `rag_query` | `(question, state, top_k)` | Per-ticker RAG retrieval |
+| `get_financial_series` | `(state, field)` | Multi-year time series for one metric |
+| `_latest_fin` | `(financial_history)` | Flatten most-recent year into a flat dict |
 
 ### Shared state (`orchestrator/state.py`)
 
@@ -338,9 +392,59 @@ Every agent inherits `BaseAgent` and must:
 | `investment_rating` | str | Orchestrator (derived from valuation) |
 | `overall_risk_score` | float | RiskAnalysisAgent |
 | `report_sections` | dict[str, str] | NarrativeAgent |
-| `agent_outputs` | list[AgentOutput] | All agents |
+| `agent_outputs` | dict[str, AgentOutput] | All agents |
 | `validation_results` | list | ComplianceAgent |
 | `critical_findings` | int | Forensic + Risk agents |
+| `thesis` | `Optional[ThesisComponent]` | NarrativeAgent |
+
+`ThesisComponent` (frozen Pydantic model in `models/research.py`) holds:
+- `variant_perception` — one-sentence differentiated view vs. consensus
+- `consensus_view`, `our_view`, `why_consensus_is_wrong`
+- `catalysts: list[str]`, `key_risks: list[str]`
+- `bull_case`, `base_case`, `bear_case` — each a `ThesisCase` with `scenario`, `narrative`,
+  `target_price`, `return_potential_pct`, `key_assumptions`, `probability ∈ [0, 1]`
+
+### Research philosophy (`core/research_philosophy.py`)
+
+Single authoritative module imported by every agent. Contains:
+
+| Symbol | Purpose |
+|---|---|
+| `RESEARCH_SEQUENCE` | Ordered list of 11 mandatory research steps |
+| `PHILOSOPHY_RULE` | Plain-English CIO rule set (objectivity, evidence, independence) |
+| `CIO_ROLE` | CIO mandate: coordinate, never analyse directly |
+| `AGENT_SPECS` | Dict keyed by agent id → `{name, role, responsibilities, deliverables, frameworks}` |
+| `RAG_DOCUMENT_TAG_FIELDS` | 9 required metadata fields for every ingested document |
+| `SOURCE_PRIORITY` | Ordered source preference chain (primary → secondary → tertiary) |
+| `EVIDENCE_RULES` | `EvidenceLevel` thresholds (HIGH ≥ 3 sources, MEDIUM = 2, LOW = 1) |
+| `REPORT_SECTIONS_20` | Ordered 20-section tuples used to structure the DOCX output |
+
+### Compliance framework (`agents/compliance_agent.py`)
+
+17 checks across two jurisdictions. `is_indian` / `is_us` country detection gates jurisdiction-specific checks.
+
+**Indian standards (7 checks):**
+- SEBI Research Analyst Regulations 2014 — applies universally (governs the research output)
+- SEBI LODR (Listing Obligations) — Indian-listed companies only
+- Companies Act 2013 (Section 149) — board composition ≥ 33% independent
+- Ind AS convergence with IFRS — Indian-listed companies only
+- RBI Prudential Guidelines — Banking sector
+- IRDAI Regulations — Insurance sector
+- AMFI Framework — Mutual fund sector
+
+**Global standards (10 checks):**
+- IFRS / IAS accounting standards
+- US GAAP — exact set lookup (`{"united states", "usa", "us", "united states of america"}`)
+- IOSCO Principles for Financial Benchmarks
+- CFA Institute Research Objectivity Standards
+- OECD Corporate Governance Principles (governance score sentinel-checked; 0 ≠ 50)
+- ISSB S1 (general sustainability disclosures) — WARN placeholder if ESG agent absent
+- ISSB S2 (climate-related disclosures) — WARN placeholder if ESG agent absent
+- SASB Standards — WARN placeholder if ESG agent absent
+- GRI Standards — WARN placeholder if ESG agent absent
+- UN PRI alignment
+
+WARN placeholders ensure the compliance score denominator stays consistent even when the ESG agent fails.
 
 ---
 
@@ -871,13 +975,26 @@ Use `PyMuPDF` (`fitz.open(path).get_text("text")`) for extraction.
 
 ### Adding a new agent
 
-1. Create `agents/my_agent.py`:
+1. Add an entry to `AGENT_SPECS` in `core/research_philosophy.py`:
+   ```python
+   "20_my_agent": {
+       "name": "My Custom Agent",
+       "role": "...",
+       "responsibilities": [...],
+       "deliverables": [...],
+   }
+   ```
+
+2. Create `agents/my_agent.py`:
    ```python
    from .base_agent import BaseAgent
    from ..models.research import AgentOutput, AgentStatus, ResearchState
+   from ..core.research_philosophy import AGENT_SPECS
+
+   _SPEC = AGENT_SPECS["20_my_agent"]
 
    class MyAgent(BaseAgent):
-       AGENT_ID   = "17_my_agent"
+       AGENT_ID   = "20_my_agent"
        AGENT_NAME = "My Custom Agent"
 
        def run(self, state: ResearchState) -> AgentOutput:
@@ -890,11 +1007,14 @@ Use `PyMuPDF` (`fitz.open(path).get_text("text")`) for extraction.
            )
    ```
 
-2. Import and add to the appropriate phase in `orchestrator/workflow.py`.
+3. Import and add to the appropriate phase in `orchestrator/workflow.py`.
 
-3. Add `AGENT_ID` to the phase list. For parallel phases (B or C), append
+4. Add `AGENT_ID` to the phase list. For parallel phases (B or C), append
    to `phase_b_agents` or `phase_c_agents`; for sequential phases (D, E),
    call `make(MyAgent).execute(state)` in order.
+
+5. If the agent produces output consumed by `ComplianceAgent`, add its id
+   to `_validate_agent_completion`'s `required` set in `compliance_agent.py`.
 
 ### Adding a new LLM provider
 
@@ -931,5 +1051,5 @@ clear_company("TICKER")
 
 ---
 
-*Document generated: 2026-06-17. Maintained in `docs/TECHNICAL_REFERENCE.md`.*
-*Platform repo: https://github.com/anubhav0499-bit/equity-research*
+*Document updated: 2026-06-17. Maintained in `docs/TECHNICAL_REFERENCE.md`.*
+*Current commit: `3fa8c0b`. Platform repo: https://github.com/anubhav0499-bit/equity-research*
