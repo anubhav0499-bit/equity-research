@@ -169,7 +169,7 @@ Return ONLY the JSON object specified."""
         summary_parts = [
             f"Industry: {details.get('industry_name', industry)}",
         ]
-        if details.get("industry_attractiveness_score"):
+        if details.get("industry_attractiveness_score") is not None:
             summary_parts.append(f"Attractiveness: {details['industry_attractiveness_score']}/100")
         if details.get("tam_estimate_usd_bn"):
             summary_parts.append(f"TAM: ${details['tam_estimate_usd_bn']:.0f}B")

@@ -53,9 +53,6 @@ class ComplianceValidationAgent(BaseAgent):
         # ── 5. Narrative word count ───────────────────────────────
         validation_results.extend(self._validate_narrative(state))
 
-        # ── 6. Regulatory disclosure checks ──────────────────────
-        compliance_checks.extend(self._check_regulatory_disclosures(state))
-
         # ── 6. Indian regulatory standards ───────────────────────
         compliance_checks.extend(self._check_indian_standards(state))
 
@@ -208,6 +205,7 @@ class ComplianceValidationAgent(BaseAgent):
         required = {
             "01_company_profiling", "03_financial_extraction",
             "06_forensic_accounting", "08_valuation", "10_narrative",
+            "17_industry_intelligence", "18_management_governance", "19_esg_sustainability",
         }
         missing = required - set(state.completed_agents)
         return [ValidationResult(
@@ -269,9 +267,10 @@ class ComplianceValidationAgent(BaseAgent):
         profile = state.company_profile or {}
         country = (profile.get("country") or "").lower()
         sector = (profile.get("sector") or "").lower()
+        # Treat unknown country as Indian (default market assumption); explicit non-Indian skips Indian-only checks
         is_indian = "india" in country or not country
 
-        # SEBI Research Analyst Regulations — universal for all research
+        # SEBI Research Analyst Regulations — applies universally (governs this research output)
         checks.append(ComplianceCheck(
             regulation="SEBI Research Analyst Regulations 2014",
             jurisdiction="IN",
@@ -280,87 +279,100 @@ class ComplianceValidationAgent(BaseAgent):
             evidence="Disclaimer section includes conflict of interest statement and AI-generated attribution.",
         ))
 
-        # SEBI LODR — listed company disclosures
-        narrative_out = state.agent_outputs.get("10_narrative")
+        # SEBI LODR — listed company disclosures (Indian-listed entities only)
         governance_out = state.agent_outputs.get("18_management_governance")
-        lodr_status = "PASS"
-        lodr_evidence = "Governance and listing obligations reviewed in agent outputs."
-        if governance_out:
-            rpt_risk = governance_out.payload.get("related_party_risk", "LOW")
-            if rpt_risk in ("HIGH", "CRITICAL"):
-                lodr_status = "WARN"
-                lodr_evidence = f"Related party transaction risk ({rpt_risk}) may indicate LODR disclosure gaps."
-        checks.append(ComplianceCheck(
-            regulation="SEBI LODR (Listing Obligations and Disclosure Requirements)",
-            jurisdiction="IN",
-            check_description="Material event disclosures; RPT disclosures; promoter holding disclosures",
-            status=lodr_status,
-            evidence=lodr_evidence,
-        ))
+        if is_indian:
+            lodr_status = "PASS"
+            lodr_evidence = "Governance and listing obligations reviewed in agent outputs."
+            if governance_out:
+                rpt_risk = governance_out.payload.get("related_party_risk", "LOW")
+                if rpt_risk in ("HIGH", "CRITICAL"):
+                    lodr_status = "WARN"
+                    lodr_evidence = f"Related party transaction risk ({rpt_risk}) may indicate LODR disclosure gaps."
+            checks.append(ComplianceCheck(
+                regulation="SEBI LODR (Listing Obligations and Disclosure Requirements)",
+                jurisdiction="IN",
+                check_description="Material event disclosures; RPT disclosures; promoter holding disclosures",
+                status=lodr_status,
+                evidence=lodr_evidence,
+            ))
 
         # Companies Act — board composition, audit committee
-        board_ind = (governance_out.payload.get("board_independence_pct", 50) if governance_out else 50) or 50
-        act_status = "PASS" if board_ind >= 33 else "FAIL"
+        board_ind_raw = (
+            governance_out.payload.get("board_independence_pct")
+            if governance_out and governance_out.payload
+            else None
+        )
+        if board_ind_raw is None:
+            act_status = "WARN"
+            act_evidence = "Board independence data unavailable — governance agent output missing or incomplete."
+        else:
+            board_ind = float(board_ind_raw)
+            act_status = "PASS" if board_ind >= 33 else "FAIL"
+            act_evidence = (
+                f"Board independence: {board_ind:.0f}% (minimum 33% required). "
+                f"{'Compliant.' if act_status == 'PASS' else 'NON-COMPLIANT — below minimum threshold.'}"
+            )
         checks.append(ComplianceCheck(
             regulation="Companies Act 2013",
             jurisdiction="IN",
             check_description="Board composition: minimum 33% independent directors; audit committee requirements",
             status=act_status,
-            evidence=f"Board independence: {board_ind:.0f}% (minimum 33% required). "
-                     f"{'Compliant.' if act_status == 'PASS' else 'NON-COMPLIANT — below minimum threshold.'}",
+            evidence=act_evidence,
         ))
 
-        # Ind AS — accounting standards
+        # Ind AS / sector checks — Indian entities only
         forensic_out = state.agent_outputs.get("06_forensic_accounting")
-        ind_as_status = "PASS"
-        ind_as_evidence = "Financial statements reviewed under Ind AS framework."
-        if forensic_out:
-            fraud_risk = forensic_out.payload.get("overall_fraud_risk", "LOW")
-            if fraud_risk in ("HIGH", "CRITICAL"):
-                ind_as_status = "WARN"
-                ind_as_evidence = f"Forensic analysis detected elevated accounting risk ({fraud_risk}) — Ind AS compliance review recommended."
-        checks.append(ComplianceCheck(
-            regulation="Ind AS (Indian Accounting Standards)",
-            jurisdiction="IN",
-            check_description="Financial statements prepared in accordance with Ind AS (converged with IFRS)",
-            status=ind_as_status,
-            evidence=ind_as_evidence,
-        ))
-
-        # RBI Guidelines — banking sector
-        if "bank" in sector or "nbfc" in sector or "financial" in sector:
-            npa_warning = False
+        if is_indian:
+            ind_as_status = "PASS"
+            ind_as_evidence = "Financial statements reviewed under Ind AS framework."
             if forensic_out:
-                findings_summary = forensic_out.summary.lower()
-                npa_warning = "npa" in findings_summary or "evergreen" in findings_summary
+                fraud_risk = forensic_out.payload.get("overall_fraud_risk", "LOW")
+                if fraud_risk in ("HIGH", "CRITICAL"):
+                    ind_as_status = "WARN"
+                    ind_as_evidence = f"Forensic analysis detected elevated accounting risk ({fraud_risk}) — Ind AS compliance review recommended."
             checks.append(ComplianceCheck(
-                regulation="RBI Guidelines (Prudential Norms)",
+                regulation="Ind AS (Indian Accounting Standards)",
                 jurisdiction="IN",
-                check_description="NPA recognition, provisioning norms, capital adequacy (CRAR) compliance",
-                status="WARN" if npa_warning else "PASS",
-                evidence="NPA evergreening risk detected — RBI prudential norms review required." if npa_warning
-                         else "Banking/NBFC sector — RBI prudential norms reviewed in forensic analysis.",
+                check_description="Financial statements prepared in accordance with Ind AS (converged with IFRS)",
+                status=ind_as_status,
+                evidence=ind_as_evidence,
             ))
 
-        # IRDAI Guidelines — insurance sector
-        if "insurance" in sector or "irdai" in sector:
-            checks.append(ComplianceCheck(
-                regulation="IRDAI Guidelines",
-                jurisdiction="IN",
-                check_description="Solvency margin compliance; investment norms; product guidelines",
-                status="PASS",
-                evidence="Insurance sector — IRDAI compliance reviewed in sector-specific analysis.",
-            ))
+            # RBI Guidelines — banking sector (Indian entities)
+            if "bank" in sector or "nbfc" in sector or "financial" in sector:
+                npa_warning = False
+                if forensic_out:
+                    findings_summary = forensic_out.summary.lower()
+                    npa_warning = "npa" in findings_summary or "evergreen" in findings_summary
+                checks.append(ComplianceCheck(
+                    regulation="RBI Guidelines (Prudential Norms)",
+                    jurisdiction="IN",
+                    check_description="NPA recognition, provisioning norms, capital adequacy (CRAR) compliance",
+                    status="WARN" if npa_warning else "PASS",
+                    evidence="NPA evergreening risk detected — RBI prudential norms review required." if npa_warning
+                             else "Banking/NBFC sector — RBI prudential norms reviewed in forensic analysis.",
+                ))
 
-        # AMFI Frameworks — mutual fund sector
-        if "mutual fund" in sector or "asset management" in sector or "amc" in sector:
-            checks.append(ComplianceCheck(
-                regulation="AMFI (Association of Mutual Funds in India) Frameworks",
-                jurisdiction="IN",
-                check_description="Fund categorisation; expense ratio; NAV disclosure; side-pocketing rules",
-                status="PASS",
-                evidence="Asset management sector — AMFI framework reviewed.",
-            ))
+            # IRDAI Guidelines — insurance sector (Indian entities)
+            if "insurance" in sector or "irdai" in sector:
+                checks.append(ComplianceCheck(
+                    regulation="IRDAI Guidelines",
+                    jurisdiction="IN",
+                    check_description="Solvency margin compliance; investment norms; product guidelines",
+                    status="PASS",
+                    evidence="Insurance sector — IRDAI compliance reviewed in sector-specific analysis.",
+                ))
+
+            # AMFI Frameworks — mutual fund sector (Indian entities)
+            if "mutual fund" in sector or "asset management" in sector or "amc" in sector:
+                checks.append(ComplianceCheck(
+                    regulation="AMFI (Association of Mutual Funds in India) Frameworks",
+                    jurisdiction="IN",
+                    check_description="Fund categorisation; expense ratio; NAV disclosure; side-pocketing rules",
+                    status="PASS",
+                    evidence="Asset management sector — AMFI framework reviewed.",
+                ))
 
         # BRSR — sustainability reporting
         esg_out = state.agent_outputs.get("19_esg_sustainability")
@@ -381,9 +393,10 @@ class ComplianceValidationAgent(BaseAgent):
         """Global regulatory and accounting standards."""
         checks = []
         profile = state.company_profile or {}
-        country = (profile.get("country") or "").lower()
-        is_us = "united states" in country or "usa" in country or "us" in country
-        is_india = "india" in country or not country
+        country = (profile.get("country") or "").lower().strip()
+        # Exact-word match avoids false positives for "australia", "russia", "belarus" etc.
+        _us_names = {"united states", "united states of america", "usa", "us"}
+        is_us = country in _us_names
         forensic_out = state.agent_outputs.get("06_forensic_accounting")
         governance_out = state.agent_outputs.get("18_management_governance")
         esg_out = state.agent_outputs.get("19_esg_sustainability")
@@ -443,22 +456,36 @@ class ComplianceValidationAgent(BaseAgent):
                      else "Valuation scenarios not yet generated — CFA fair presentation requires scenario analysis.",
         ))
 
-        # OECD Governance Principles
-        gov_score = (governance_out.payload.get("governance_score", 50) if governance_out else 50) or 50
-        oecd_status = "PASS" if gov_score >= 60 else ("WARN" if gov_score >= 40 else "FAIL")
+        # OECD Governance Principles — use None sentinel to avoid coercing score=0 to 50
+        gov_score_raw = (
+            governance_out.payload.get("governance_score")
+            if governance_out and governance_out.payload
+            else None
+        )
+        if gov_score_raw is None:
+            oecd_status = "WARN"
+            oecd_evidence = "Governance score unavailable — governance agent output missing or incomplete."
+        else:
+            gov_score = float(gov_score_raw)
+            oecd_status = "PASS" if gov_score >= 60 else ("WARN" if gov_score >= 40 else "FAIL")
+            oecd_evidence = (
+                f"Governance score: {gov_score:.0f}/100. "
+                f"{'Meets OECD governance principles.' if oecd_status == 'PASS' else 'Below OECD governance baseline — board effectiveness review required.'}"
+            )
         checks.append(ComplianceCheck(
             regulation="OECD Principles of Corporate Governance",
             jurisdiction="GLOBAL",
             check_description="Shareholder rights; board accountability; disclosure; stakeholder engagement",
             status=oecd_status,
-            evidence=f"Governance score: {gov_score}/100. "
-                     f"{'Meets OECD governance principles.' if oecd_status == 'PASS' else 'Below OECD governance baseline — board effectiveness review required.'}",
+            evidence=oecd_evidence,
         ))
 
-        # ISSB — climate and sustainability
-        if esg_out:
+        # ISSB / SASB / GRI — emit NA placeholder when ESG agent has not run so the
+        # compliance score denominator is not silently shrunk (bug fix: previously these
+        # three checks were dropped entirely when esg_out was None, inflating the score).
+        if esg_out and esg_out.payload:
             tcfd = esg_out.payload.get("tcfd_disclosure", "N/A")
-            issb_status = "PASS" if tcfd == "FULL" else ("WARN" if tcfd == "PARTIAL" else ("FAIL" if tcfd == "NONE" else "NA"))
+            issb_status = "PASS" if tcfd == "FULL" else ("WARN" if tcfd == "PARTIAL" else ("FAIL" if tcfd == "NONE" else "WARN"))
             checks.append(ComplianceCheck(
                 regulation="ISSB (International Sustainability Standards Board) S1 & S2",
                 jurisdiction="GLOBAL",
@@ -467,19 +494,18 @@ class ComplianceValidationAgent(BaseAgent):
                 evidence=f"TCFD/ISSB disclosure level: {tcfd}.",
             ))
 
-            # SASB — sector-specific
+            disc_quality = esg_out.payload.get("sustainability_disclosure_quality", "ADEQUATE")
+            sasb_status = "PASS" if esg_out.payload.get("material_esg_issues") else "WARN"
             checks.append(ComplianceCheck(
                 regulation="SASB (Sustainability Accounting Standards Board)",
                 jurisdiction="GLOBAL",
                 check_description="Sector-specific material ESG factors disclosure",
-                status="PASS" if esg_out.payload.get("material_esg_issues") else "WARN",
+                status=sasb_status,
                 evidence=f"Material ESG issues identified: {len(esg_out.payload.get('material_esg_issues', []))} issues. "
                          f"Sector-specific SASB metrics reviewed in ESG analysis.",
             ))
 
-            # GRI — comprehensive ESG reporting
-            disc_quality = esg_out.payload.get("sustainability_disclosure_quality", "ADEQUATE")
-            gri_status = "PASS" if disc_quality in ("STRONG", "ADEQUATE") else "WARN" if disc_quality == "WEAK" else "FAIL"
+            gri_status = "PASS" if disc_quality in ("STRONG", "ADEQUATE") else ("WARN" if disc_quality == "WEAK" else "FAIL")
             checks.append(ComplianceCheck(
                 regulation="GRI (Global Reporting Initiative) Standards",
                 jurisdiction="GLOBAL",
@@ -488,5 +514,22 @@ class ComplianceValidationAgent(BaseAgent):
                 evidence=f"Sustainability disclosure quality: {disc_quality}. "
                          f"{'GRI-aligned disclosure detected.' if gri_status == 'PASS' else 'Disclosure gaps identified — GRI Standards review recommended.'}",
             ))
+        else:
+            # ESG agent did not run — add WARN placeholders so the denominator stays consistent
+            for reg, desc in [
+                ("ISSB (International Sustainability Standards Board) S1 & S2",
+                 "General sustainability disclosures (S1); Climate-related disclosures (S2)"),
+                ("SASB (Sustainability Accounting Standards Board)",
+                 "Sector-specific material ESG factors disclosure"),
+                ("GRI (Global Reporting Initiative) Standards",
+                 "Comprehensive ESG reporting: materiality, stakeholder engagement, disclosure quality"),
+            ]:
+                checks.append(ComplianceCheck(
+                    regulation=reg,
+                    jurisdiction="GLOBAL",
+                    check_description=desc,
+                    status="WARN",
+                    evidence="ESG agent did not produce output — sustainability standard could not be evaluated.",
+                ))
 
         return checks

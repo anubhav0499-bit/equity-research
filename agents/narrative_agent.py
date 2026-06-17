@@ -297,25 +297,29 @@ Return ONLY a valid JSON object with this exact structure:
         )
 
         if not isinstance(result, dict) or "error" in result:
-            return ThesisComponent(
-                variant_perception="Thesis construction requires valuation completion.",
-                consensus_view="Market view not yet determined.",
-                our_view="Research synthesis incomplete.",
+            self._logger.warning(
+                f"_build_thesis_component: LLM returned unusable result "
+                f"(type={type(result).__name__}); returning empty ThesisComponent."
             )
+            return ThesisComponent()
 
         def _make_case(data: Optional[dict]) -> Optional[ThesisCase]:
             if not data:
                 return None
             try:
+                prob = data.get("probability")
+                if prob is not None:
+                    prob = max(0.0, min(1.0, float(prob)))
                 return ThesisCase(
                     scenario=data.get("scenario", "BASE"),
                     narrative=data.get("narrative", ""),
                     target_price=data.get("target_price"),
                     return_potential_pct=data.get("return_potential_pct"),
                     key_assumptions=data.get("key_assumptions", []),
-                    probability=data.get("probability"),
+                    probability=prob,
                 )
-            except Exception:
+            except Exception as exc:
+                self._logger.warning(f"_make_case failed to build ThesisCase from LLM data: {exc}")
                 return None
 
         return ThesisComponent(

@@ -188,6 +188,26 @@ class BaseAgent(ABC):
             return 50.0
         return round(sum(scores) / len(scores), 1)
 
+    def _latest_fin(self, financial_history: dict) -> dict:
+        """Return the most recent year's flat financial dict from financial_history."""
+        if not financial_history:
+            return {}
+        years = sorted(
+            (k for k in financial_history if isinstance(financial_history[k], dict)),
+            reverse=True,
+        )
+        if not years:
+            return {}
+        data = financial_history[years[0]]
+        # Merge income_statements, balance_sheets, cash_flows into a flat dict
+        flat: dict = {}
+        for sub in ("income_statements", "balance_sheets", "cash_flows"):
+            sub_data = data.get(sub, {})
+            if isinstance(sub_data, dict):
+                flat.update(sub_data)
+        flat.update({k: v for k, v in data.items() if not isinstance(v, dict)})
+        return flat
+
     def get_financial_series(self, state: ResearchState, field: str) -> dict[str, float]:
         history = state.financial_history or {}
         is_dict = isinstance(history, dict)
