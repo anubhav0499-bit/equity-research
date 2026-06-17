@@ -185,6 +185,40 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_DIR = DATA_DIR / "logs"
 
 
+@dataclass
+class RAGConfig:
+    # ── Embedding ─────────────────────────────────────────────────────
+    model_name: str   = "BAAI/bge-small-en-v1.5"   # ~130MB, free, local
+    fallback_model: str = "all-MiniLM-L6-v2"
+    # ── Chunking ──────────────────────────────────────────────────────
+    chunking_mode: str  = "auto"       # auto | semantic | recursive | contextual
+    child_chunk_size: int   = 256      # small chunks for high-precision retrieval
+    child_chunk_overlap: int = 32
+    parent_chunk_size: int  = 1024     # large chunks returned as context (multi-vector)
+    parent_chunk_overlap: int = 128
+    semantic_threshold: float = 0.75   # cosine threshold for semantic split boundaries
+    # ── Retrieval ─────────────────────────────────────────────────────
+    top_k: int = 5
+    candidate_multiplier: int = 4      # retrieve top_k × multiplier before re-ranking
+    min_candidates: int = 20
+    hyde_enabled: bool = True          # Hypothetical Document Embeddings
+    # ── Compression ───────────────────────────────────────────────────
+    compression_enabled: bool = True
+    compression_max_chars: int = 8000
+    # ── Memory ────────────────────────────────────────────────────────
+    memory_max_turns: int = 10
+    memory_max_chars: int = 4000
+    # ── Guardrails ────────────────────────────────────────────────────
+    groundedness_threshold: float = 0.70
+    confidence_threshold: float  = 0.60
+    # ── Evaluation ────────────────────────────────────────────────────
+    ragas_enabled: bool = False        # expensive — opt-in per run
+    # ── Backend ───────────────────────────────────────────────────────
+    vector_backend: str = "faiss"      # faiss | chroma
+
+RAG_CONFIG = RAGConfig()
+
+
 def validate_llm_config() -> str:
     """
     Return the active provider name, or raise RuntimeError with setup instructions

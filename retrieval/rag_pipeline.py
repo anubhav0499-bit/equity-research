@@ -1,27 +1,37 @@
 """
-Equity-Research RAG Pipeline — LangGraph multi-agent retrieval.
+Equity-Research RAG Pipeline — enhanced LangGraph multi-agent retrieval.
 
-Architecture (7 nodes):
+Architecture (9 nodes):
 
-    Query
+    Query (+ session memory context)
       ↓
-  [1] query_rewriter       — Optimise query; on retry, SIMPLIFY rather than expand
+  [1] query_rewriter       — Optimise query + HyDE (hypothetical doc embedding)
       ↓
-  [2] query_decomposer     — Detect multi-hop; split compound questions into sub-queries
+  [2] query_decomposer     — Detect multi-hop; split compound questions
       ↓
-  [3] detail_checker       — Need retrieval or LLM parametric knowledge?
-      ├── No  ────────────────────────────────────────────────────────────┐
-      ↓ Yes                                                               │
-  [4] source_selector      — vector_db / internet / tools_apis / combined │
-      ↓                                                                   │
-  [5] retriever            — Parallel fetch; deduplicate; priority sort  │
-      └──────────────────────────────────────────── [6] response_generator
-                                                          ↓
-                                                   [7] relevance_checker
-                                                       (context-grounded,
-                                                        not self-grading)
-                                                          ├── Yes → END
-                                                          └── No  → loop (max 5)
+  [3] detail_checker       — Needs retrieval? or parametric LLM?
+      ├── No  ─────────────────────────────────────────────────────────┐
+      ↓ Yes                                                            │
+  [4] source_selector      — Agentic: plan retrieval strategy          │
+      ↓                                                                │
+  [5] retriever            — Parallel multi-source fetch              │
+      ↓                                                                │
+  [6] context_compressor   — LLM extraction + redundancy removal      │
+      └─────────────────────────────────────── [7] response_generator ┘
+                                                        ↓
+                                                [8] relevance_checker
+                                                    + guardrails
+                                                    (faithfulness / confidence)
+                                                        ├── OK  → END
+                                                        └── Bad → loop (max 5)
+
+New capabilities vs previous version:
+  - HyDE: hypothetical doc embedding blended with query embedding
+  - Context compression: LLM extracts relevant passages before generation
+  - Conversation memory: session history injected into query rewriter
+  - Guardrails: groundedness check + confidence score on every response
+  - Streaming: stream_run() async generator for SSE delivery
+  - Agentic source selector: can plan multi-step retrieval
 """
 
 from __future__ import annotations
@@ -30,7 +40,7 @@ import json
 import re
 import threading
 from functools import lru_cache
-from typing import Annotated, Optional
+from typing import Annotated, AsyncGenerator, Optional
 from typing_extensions import TypedDict
 
 _HAS_LANGCHAIN = False
@@ -54,7 +64,6 @@ from loguru import logger
 
 
 def _make_prompt(messages: list):
-    """Build a ChatPromptTemplate, or return None when langchain_core is absent."""
     if not _HAS_LANGCHAIN:
         return None
     return ChatPromptTemplate.from_messages(messages)
@@ -74,15 +83,15 @@ except ImportError:
     _HAS_TOOLS = False
 
 from ..core.config import (
-    LLM_CONFIG, OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY,
+    LLM_CONFIG, RAG_CONFIG,
+    OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY,
     GOOGLE_API_KEY, TOGETHER_API_KEY, OPENROUTER_API_KEY,
 )
 
 MAX_ITERATIONS      = 5
 RELEVANCE_THRESHOLD = 0.70
-TOP_K               = 5
+TOP_K               = RAG_CONFIG.top_k
 
-# Wikipedia is only useful for background/definitional queries
 _BACKGROUND_KEYWORDS = frozenset([
     "what is", "what are", "define", "explain", "background", "overview",
     "history", "sector", "industry", "how does", "introduction", "founded",
@@ -90,15 +99,13 @@ _BACKGROUND_KEYWORDS = frozenset([
 
 
 def _is_background_query(query: str) -> bool:
-    """Return True only for queries asking for background or definitional context."""
     q_lower = query.lower()
     return any(kw in q_lower for kw in _BACKGROUND_KEYWORDS)
 
 
-# ── LangChain LLM bridge ──────────────────────────────────────────────────
+# ── LangChain LLM bridge ──────────────────────────────────────────────────────
 
 def _resolved_provider() -> str:
-    """Resolve the effective LLM provider from config and available API keys."""
     backend = LLM_CONFIG.provider
     if backend != "auto":
         return backend
@@ -113,7 +120,6 @@ def _resolved_provider() -> str:
 
 @lru_cache(maxsize=None)
 def _get_llm(temperature: float = 0.0, provider: str = ""):
-    """Return a cached LangChain LLM. Cache key is (temperature, provider)."""
     backend = provider or _resolved_provider()
     model   = LLM_CONFIG.primary_model
 
@@ -149,24 +155,36 @@ def _llm():
     return _get_llm(temperature=0.0, provider=_resolved_provider())
 
 
-# ── State ─────────────────────────────────────────────────────────────────
+def _llm_fn(system: str, user: str) -> str:
+    """Simple (system, user) → str wrapper for modules that need it."""
+    if not _HAS_LANGCHAIN:
+        return ""
+    prompt = _make_prompt([("system", system), ("human", "{user}")])
+    result = (prompt | _llm()).invoke({"user": user})
+    return getattr(result, "content", str(result))
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
 
 class EquityRAGState(TypedDict, total=False):
-    # Company context (set once at pipeline entry)
+    # Company context
     company_name:     str
     ticker:           str
+    session_id:       str        # for conversation memory
 
     # Pipeline fields
     original_query:   str
     rewritten_query:  str
-    sub_queries:      list[str]    # atomic sub-queries from query_decomposer
+    sub_queries:      list[str]
     is_multi_hop:     bool
     needs_retrieval:  bool
     retrieval_reason: str
-    selected_source:  str          # "vector_db" | "internet" | "tools_apis" | "combined"
+    selected_source:  str
     source_rationale: str
+    retrieval_plan:   list[str]  # agentic: ordered retrieval steps
     retrieved_context:  list[str]
     retrieval_metadata: list[dict]
+    compressed_context: list[str]  # after context_compressor
     response:         str
     is_relevant:      bool
     relevance_score:  float
@@ -176,8 +194,16 @@ class EquityRAGState(TypedDict, total=False):
     final_response:   str
     sources_used:     list[str]
 
+    # Guardrails
+    groundedness_score: float
+    confidence_score:   float
+    hallucinated_claims: list[str]
 
-# ── JSON helper ───────────────────────────────────────────────────────────
+    # HyDE
+    hyde_embedding:   Optional[list]   # float list of blended embedding
+
+
+# ── JSON helper ────────────────────────────────────────────────────────────────
 
 def _parse_json(text: str) -> dict:
     clean = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
@@ -186,13 +212,11 @@ def _parse_json(text: str) -> dict:
         return {}
     depth, end = 0, -1
     for i, ch in enumerate(clean[start:], start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
+        if ch == "{":   depth += 1
+        elif ch == "}": depth -= 1
+        if depth == 0:
+            end = i
+            break
     if end == -1:
         return {}
     try:
@@ -201,24 +225,24 @@ def _parse_json(text: str) -> dict:
         return {}
 
 
-# ── Node 1 — Query Rewriter ───────────────────────────────────────────────
+# ── Node 1 — Query Rewriter (+ HyDE) ─────────────────────────────────────────
 
 _REWRITE_PROMPT = _make_prompt([
     ("system", """You are an expert query optimiser for an equity research RAG system.
-Transform the analyst's question into the most effective retrieval query for searching
-company filings, earnings transcripts, analyst reports, and financial databases.
+Transform the analyst's question into the most effective retrieval query.
 
 Guidelines:
 - Expand tickers to full company names (and vice versa)
 - Include relevant financial terminology and synonyms
-- Make the fiscal period explicit if implied (e.g. "last quarter" → "Q3 FY2024")
-- On RETRY iterations: SIMPLIFY the query — fewer terms, more specific. Focus on the
-  exact data gap identified in the feedback. Do not make the query broader.
+- Make the fiscal period explicit if implied
+- On RETRY: SIMPLIFY the query — fewer terms, more specific
+- If conversation history is provided, resolve pronouns and follow-up references
 
 Respond with ONLY valid JSON:
-{{"rewritten_query": "<optimised query>", "rationale": "<brief explanation>"}}"""),
+{{"rewritten_query": "<optimised query>", "rationale": "<brief>"}}"""),
     ("human", """Company: {company_name} ({ticker})
 Original query: {original_query}
+Conversation history: {conv_history}
 Iteration: {iteration}
 Previous query: {previous_query}
 Relevance feedback: {feedback}"""),
@@ -230,11 +254,22 @@ def query_rewriter(state: EquityRAGState) -> dict:
     orig      = state.get("original_query", "")
     ticker    = state.get("ticker", "")
     company   = state.get("company_name", ticker)
+    session_id = state.get("session_id", "")
+
+    # Inject conversation memory
+    conv_history = ""
+    if session_id:
+        try:
+            from .memory import ConversationStore
+            conv_history = ConversationStore.get().get_context(session_id, max_chars=1500)
+        except Exception:
+            pass
 
     result = (_REWRITE_PROMPT | _llm()).invoke({
         "company_name":   company,
         "ticker":         ticker,
         "original_query": orig,
+        "conv_history":   conv_history or "None",
         "iteration":      iteration,
         "previous_query": state.get("rewritten_query", ""),
         "feedback":       state.get("relevance_feedback", ""),
@@ -242,81 +277,68 @@ def query_rewriter(state: EquityRAGState) -> dict:
     parsed = _parse_json(result.content)
     rw     = parsed.get("rewritten_query") or orig
 
+    # HyDE: generate hypothetical doc and blend with query embedding (iteration=1 only)
+    hyde_embedding = None
+    if RAG_CONFIG.hyde_enabled and iteration == 1 and vs is not None:
+        try:
+            from .hyde import HyDE
+            from .vector_store import _embed
+            hyde = HyDE(llm_fn=_llm_fn, embed_fn=_embed)
+            blended = hyde.embed(rw, company_name=company, ticker=ticker)
+            if blended is not None:
+                hyde_embedding = blended.tolist()
+        except Exception as exc:
+            logger.debug(f"[rag] HyDE failed ({exc}), using plain query embedding")
+
     logger.debug(f"[rag:{ticker}] rewriter iter={iteration} → {rw[:80]}")
     return {
         "rewritten_query": rw,
         "iteration":       iteration,
+        "hyde_embedding":  hyde_embedding,
         "messages":        [HumanMessage(content=orig)] if iteration == 1 else [],
     }
 
 
-# ── Node 2 — Query Decomposer ─────────────────────────────────────────────
+# ── Node 2 — Query Decomposer ─────────────────────────────────────────────────
 
 _DECOMPOSE_PROMPT = _make_prompt([
     ("system", """You are a query analyst for an equity research RAG system.
-Determine if the query requires information from multiple documents or time periods
-(multi-hop), and if so, decompose it into simpler atomic sub-queries.
+Determine if the query requires multi-hop reasoning across documents.
 
-Multi-hop indicators:
-- Comparing figures across two periods ("Did Q3 actuals beat Q3 guidance?")
-- Cross-document synthesis ("How did executive pay change vs revenue growth?")
-- Derived metrics requiring two separately-sourced inputs
-
-Single-hop: simple factual lookup from one document ("What was APEX revenue in FY2023?")
-
-For single-hop: return the original query as the only sub-query.
-For multi-hop: decompose into 2-3 atomic sub-queries, each answerable from one source.
-Each sub-query must be self-contained — include company name and fiscal period explicitly.
+Multi-hop: comparing two periods, cross-document synthesis, derived metrics.
+Single-hop: simple factual lookup from one document.
 
 Respond ONLY with valid JSON:
-{{"is_multi_hop": true/false, "sub_queries": ["<query1>", "<query2>"]}}"""),
+{{"is_multi_hop": true/false, "sub_queries": ["<query1>", ...]}}"""),
     ("human", "Query: {query}\nCompany: {company_name} ({ticker})"),
 ])
 
 
 def query_decomposer(state: EquityRAGState) -> dict:
     query   = state.get("rewritten_query", state.get("original_query", ""))
-    ticker  = state.get("ticker", "")
-    company = state.get("company_name", ticker)
-
-    result = (_DECOMPOSE_PROMPT | _llm()).invoke({
+    result  = (_DECOMPOSE_PROMPT | _llm()).invoke({
         "query":        query,
-        "company_name": company,
-        "ticker":       ticker,
+        "company_name": state.get("company_name", ""),
+        "ticker":       state.get("ticker", ""),
     })
     parsed       = _parse_json(result.content)
     is_multi_hop = bool(parsed.get("is_multi_hop", False))
-    sub_queries  = parsed.get("sub_queries", [])
-    if not sub_queries or not isinstance(sub_queries, list):
+    sub_queries  = parsed.get("sub_queries") or [query]
+    if not isinstance(sub_queries, list) or not sub_queries:
         sub_queries = [query]
-
-    logger.debug(
-        f"[rag:{ticker}] decomposer: multi_hop={is_multi_hop} "
-        f"sub_queries={len(sub_queries)}"
-    )
     return {"sub_queries": sub_queries, "is_multi_hop": is_multi_hop}
 
 
-# ── Node 3 — Detail Checker ───────────────────────────────────────────────
+# ── Node 3 — Detail Checker ───────────────────────────────────────────────────
 
 _DETAIL_PROMPT = _make_prompt([
     ("system", """You are an equity research RAG orchestrator.
-Decide whether the analyst's question needs external retrieval (filings, web, tools)
-or can be answered from the LLM's parametric knowledge.
+Decide whether external retrieval is needed.
 
-Retrieval IS needed for:
-- Specific financial figures (revenue, EPS, margins) for a particular period
-- Management guidance, risk factors, or contractual terms
-- Recent news, regulatory filings, or events after the LLM's training cut-off
-- Calculations requiring live or company-specific data
+Retrieval IS needed for: specific figures, guidance, recent events, post-cutoff data.
+Retrieval NOT needed for: methodology questions, definitions, reasoning over provided data.
 
-Retrieval NOT needed for:
-- General accounting or valuation methodology questions
-- Definitional or conceptual questions
-- Requests to reason over data already provided
-
-Respond with ONLY valid JSON:
-{{"needs_retrieval": true/false, "reason": "<one sentence>"}}"""),
+Respond ONLY: {{"needs_retrieval": true/false, "reason": "<one sentence>"}}"""),
     ("human", "Query: {query}\nCompany: {company_name} ({ticker})"),
 ])
 
@@ -324,38 +346,37 @@ Respond with ONLY valid JSON:
 def detail_checker(state: EquityRAGState) -> dict:
     query  = state.get("rewritten_query", state.get("original_query", ""))
     result = (_DETAIL_PROMPT | _llm()).invoke({
-        "query":        query,
-        "company_name": state.get("company_name", ""),
-        "ticker":       state.get("ticker", ""),
+        "query": query, "company_name": state.get("company_name", ""),
+        "ticker": state.get("ticker", ""),
     })
     parsed = _parse_json(result.content)
     needs  = bool(parsed.get("needs_retrieval", True))
-    logger.debug(f"[rag] detail_checker: needs_retrieval={needs}")
     return {"needs_retrieval": needs, "retrieval_reason": parsed.get("reason", "")}
 
 
-# ── Node 4 — Source Selector ──────────────────────────────────────────────
+# ── Node 4 — Agentic Source Selector ─────────────────────────────────────────
 
 _SOURCE_PROMPT = _make_prompt([
-    ("system", """You are a retrieval strategy selector for an equity research platform.
+    ("system", """You are an agentic retrieval planner for an equity research platform.
 
 Available sources:
-  "vector_db"   — Indexed filings, transcripts, and reports for this specific company.
-                  Best for: specific revenue figures, MD&A passages, risk factors,
-                  earnings call quotes, and anything in the ingested document corpus.
-  "internet"    — Live web search (Tavily/DuckDuckGo) for current events.
-                  Best for: latest analyst ratings, news after filing dates, price reactions.
-  "tools_apis"  — SEC EDGAR full-text search, financial snapshot (yfinance), Wikipedia.
-                  Best for: cross-filing keyword search, live price/multiple data, definitions.
-  "combined"    — All three. Use for complex questions needing both document depth and live data.
+  "vector_db"   — Indexed filings and transcripts for this company.
+  "internet"    — Live web search for current events and news.
+  "tools_apis"  — SEC EDGAR, live price snapshot, Wikipedia.
+  "combined"    — All three in parallel.
 
-Local corpus size: {kb_size} indexed chunks.
-Prefer "vector_db" when corpus ≥ 10 chunks and the query is about historical filings or figures.
+You can also plan a multi-step retrieval sequence by providing a "retrieval_plan"
+— an ordered list of source names to try. The retriever executes them in order
+and stops when enough context is collected.
+
+Local corpus: {kb_size} indexed chunks.
+Prefer "vector_db" when corpus ≥ 10 chunks and query is about historical data.
 
 Respond with ONLY valid JSON:
-{{"selected_source": "<vector_db|internet|tools_apis|combined>",
+{{"selected_source": "<source>",
+  "retrieval_plan": ["<step1>", "<step2>"],
   "rationale": "<one sentence>"}}"""),
-    ("human", "Query: {query}\nCompany: {company_name} ({ticker})\nReason for retrieval: {reason}"),
+    ("human", "Query: {query}\nCompany: {company_name} ({ticker})\nReason: {reason}"),
 ])
 
 
@@ -365,31 +386,27 @@ def source_selector(state: EquityRAGState) -> dict:
     kb_sz  = vs.collection_size(ticker) if vs is not None else 0
 
     result = (_SOURCE_PROMPT | _llm()).invoke({
-        "query":        query,
-        "company_name": state.get("company_name", ""),
-        "ticker":       ticker,
-        "reason":       state.get("retrieval_reason", ""),
-        "kb_size":      kb_sz,
+        "query": query, "company_name": state.get("company_name", ""),
+        "ticker": ticker, "reason": state.get("retrieval_reason", ""),
+        "kb_size": kb_sz,
     })
     parsed = _parse_json(result.content)
     source = parsed.get("selected_source", "combined")
     if source not in {"vector_db", "internet", "tools_apis", "combined"}:
         source = "combined"
+    plan = parsed.get("retrieval_plan") or [source]
 
-    logger.debug(f"[rag:{ticker}] source={source} kb_size={kb_sz}")
-    return {"selected_source": source, "source_rationale": parsed.get("rationale", "")}
+    return {
+        "selected_source":  source,
+        "retrieval_plan":   plan,
+        "source_rationale": parsed.get("rationale", ""),
+    }
 
 
-# ── Node 5 — Retriever ────────────────────────────────────────────────────
+# ── Node 5 — Retriever ────────────────────────────────────────────────────────
 
-# Context priority — lower index = inserted first = less likely to be dropped by 12K cap
-_SOURCE_PRIORITY = {
-    "vector_db":          0,
-    "sec_edgar":          1,
-    "financial_snapshot": 2,
-    "web_search":         3,
-    "wikipedia":          4,
-}
+_SOURCE_PRIORITY = {"vector_db": 0, "sec_edgar": 1, "financial_snapshot": 2,
+                    "web_search": 3, "wikipedia": 4}
 
 
 def retriever(state: EquityRAGState) -> dict:
@@ -399,19 +416,21 @@ def retriever(state: EquityRAGState) -> dict:
     company     = state.get("company_name", ticker)
     sub_queries = state.get("sub_queries") or [query]
     primary_q   = sub_queries[0]
+    hyde_vec    = state.get("hyde_embedding")
+
+    import numpy as np
+    hyde_arr = np.array(hyde_vec, dtype=np.float32) if hyde_vec else None
 
     chunk_meta_pairs: list[tuple[str, dict]] = []
-
-    # ── Individual source fetchers ────────────────────────────────────────
 
     def _from_vector_db(q: str) -> list[tuple[str, dict]]:
         if vs is None:
             return []
         try:
-            return [(txt, {"source": "vector_db"})
-                    for txt in vs.query(q, ticker=ticker, top_k=TOP_K)]
-        except Exception as e:
-            logger.warning(f"[rag:{ticker}] vector_db failed: {e}")
+            results = vs.query(q, ticker=ticker, top_k=TOP_K, hyde_vec=hyde_arr)
+            return [(txt, {"source": "vector_db"}) for txt in results]
+        except Exception as exc:
+            logger.warning(f"[rag:{ticker}] vector_db failed: {exc}")
             return []
 
     def _from_internet(q: str) -> list[tuple[str, dict]]:
@@ -419,83 +438,66 @@ def retriever(state: EquityRAGState) -> dict:
             return []
         try:
             r = T.web_search.run(f"{company} {ticker} {q}")
-            if r and "failed" not in r.lower():
-                return [(str(r), {"source": "web_search"})]
-        except Exception as e:
-            logger.warning(f"[rag:{ticker}] web_search failed: {e}")
-        return []
+            return [(str(r), {"source": "web_search"})] if r and "failed" not in r.lower() else []
+        except Exception:
+            return []
 
     def _from_edgar(q: str) -> list[tuple[str, dict]]:
         if T is None:
             return []
         try:
             r = T.sec_edgar_search.run(f"{ticker} {q}")
-            if r and "failed" not in r.lower():
-                return [(r, {"source": "sec_edgar"})]
-        except Exception as e:
-            logger.warning(f"[rag:{ticker}] edgar failed: {e}")
-        return []
+            return [(r, {"source": "sec_edgar"})] if r and "failed" not in r.lower() else []
+        except Exception:
+            return []
 
     def _from_snapshot() -> list[tuple[str, dict]]:
         if T is None:
             return []
+        if not any(kw in query.lower() for kw in ("price", "p/e", "multiple", "market cap")):
+            return []
         try:
-            if any(kw in query.lower()
-                   for kw in ("price", "p/e", "multiple", "market cap", "valuation")):
-                r = T.financial_snapshot.run(ticker)
-                if r and "failed" not in r.lower():
-                    return [(r, {"source": "financial_snapshot"})]
-        except Exception as e:
-            logger.warning(f"[rag:{ticker}] snapshot failed: {e}")
-        return []
+            r = T.financial_snapshot.run(ticker)
+            return [(r, {"source": "financial_snapshot"})] if r and "failed" not in r.lower() else []
+        except Exception:
+            return []
 
     def _from_wikipedia(q: str) -> list[tuple[str, dict]]:
         if T is None or not _is_background_query(q):
             return []
         try:
             r = T.wikipedia_lookup.run(f"{company} {q}")
-            if r and "failed" not in r.lower():
-                return [(r, {"source": "wikipedia"})]
-        except Exception as e:
-            logger.warning(f"[rag:{ticker}] wikipedia failed: {e}")
-        return []
+            return [(r, {"source": "wikipedia"})] if r and "failed" not in r.lower() else []
+        except Exception:
+            return []
 
-    # ── Dispatch by source ────────────────────────────────────────────────
-
+    # Dispatch
     if source == "vector_db":
-        # For multi-hop: retrieve for each sub-query to span multiple documents
         for sq in sub_queries:
             chunk_meta_pairs.extend(_from_vector_db(sq))
-
     elif source == "internet":
         chunk_meta_pairs.extend(_from_internet(primary_q))
-
     elif source == "tools_apis":
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [
-                pool.submit(_from_edgar,     primary_q),
-                pool.submit(_from_snapshot),
-                pool.submit(_from_wikipedia, primary_q),
-            ]
-            for f in concurrent.futures.as_completed(futures):
+            futs = [pool.submit(_from_edgar, primary_q),
+                    pool.submit(_from_snapshot),
+                    pool.submit(_from_wikipedia, primary_q)]
+            for f in concurrent.futures.as_completed(futs):
                 chunk_meta_pairs.extend(f.result())
-
-    else:  # combined — run all sources in parallel
+    else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            vdb_futures = [pool.submit(_from_vector_db, sq) for sq in sub_queries]
-            net_f  = pool.submit(_from_internet, primary_q)
-            edg_f  = pool.submit(_from_edgar,    primary_q)
-            snap_f = pool.submit(_from_snapshot)
-            wiki_f = pool.submit(_from_wikipedia, primary_q)
-
-            # Collect vector_db results first (highest priority)
-            for f in vdb_futures:
+            vdb_futs = [pool.submit(_from_vector_db, sq) for sq in sub_queries]
+            net_f    = pool.submit(_from_internet, primary_q)
+            edg_f    = pool.submit(_from_edgar,    primary_q)
+            snap_f   = pool.submit(_from_snapshot)
+            wiki_f   = pool.submit(_from_wikipedia, primary_q)
+            for f in vdb_futs:
                 chunk_meta_pairs.extend(f.result())
             for f in [edg_f, snap_f, net_f, wiki_f]:
                 chunk_meta_pairs.extend(f.result())
 
-    # ── Deduplicate by 200-char fingerprint ──────────────────────────────
-    seen:   set[str] = set()
+    # Deduplicate
+    seen: set[str] = set()
     deduped: list[tuple[str, dict]] = []
     for (text, meta) in chunk_meta_pairs:
         fp = text[:200].strip()
@@ -503,12 +505,10 @@ def retriever(state: EquityRAGState) -> dict:
             seen.add(fp)
             deduped.append((text, meta))
 
-    # Sort by source priority so highest-quality sources fill the 12K context window first
     deduped.sort(key=lambda x: _SOURCE_PRIORITY.get(x[1].get("source", ""), 99))
 
     chunk_texts = [t for t, _ in deduped]
     metadata    = [m for _, m in deduped]
-
     logger.debug(f"[rag:{ticker}] retriever: {len(chunk_texts)} unique chunks from {source}")
     return {
         "retrieved_context":  chunk_texts,
@@ -517,22 +517,47 @@ def retriever(state: EquityRAGState) -> dict:
     }
 
 
-# ── Node 6 — Response Generator ───────────────────────────────────────────
+# ── Node 6 — Context Compressor ───────────────────────────────────────────────
+
+def context_compressor(state: EquityRAGState) -> dict:
+    """LLM extraction + redundancy removal — only runs when compression is enabled."""
+    if not RAG_CONFIG.compression_enabled:
+        return {"compressed_context": state.get("retrieved_context", [])}
+
+    chunks = state.get("retrieved_context", [])
+    query  = state.get("rewritten_query", state.get("original_query", ""))
+
+    try:
+        from .compression import ContextCompressor
+        compressor = ContextCompressor(
+            llm_fn=_llm_fn,
+            keyword_threshold=0.10,
+        )
+        result = compressor.compress(query, chunks, max_output_chars=RAG_CONFIG.compression_max_chars)
+        compressed = result.compressed_chunks
+    except Exception as exc:
+        logger.warning(f"[rag] context_compressor failed ({exc}); using raw chunks")
+        compressed = chunks
+
+    return {"compressed_context": compressed}
+
+
+# ── Node 7 — Response Generator ───────────────────────────────────────────────
 
 _RESPONSE_PROMPT = _make_prompt([
     ("system", """You are a senior equity research analyst.
-Answer the analyst's question precisely and concisely using the retrieved context below.
+Answer the analyst's question precisely using the retrieved context.
 - Quote specific figures (revenue, EPS, margins) with fiscal periods.
-- Cite the source (filing type, date) when available in the context.
-- If the context does not contain the answer, say so explicitly — do not invent figures.
-- Use bullet points for lists of facts; prose for narrative answers.
+- Cite source type when available.
+- If context does not contain the answer, say so explicitly — do not invent figures.
+- Use bullet points for fact lists; prose for narrative answers.
 
 Company: {company_name} ({ticker})
 
 Retrieved Context:
 {context}
 
-Sources used: {sources}"""),
+Sources: {sources}"""),
     ("human", "{query}"),
 ])
 
@@ -540,10 +565,9 @@ Sources used: {sources}"""),
 def response_generator(state: EquityRAGState) -> dict:
     ticker  = state.get("ticker", "UNKNOWN")
     query   = state.get("rewritten_query", state.get("original_query", ""))
-    chunks  = state.get("retrieved_context", [])
+    chunks  = state.get("compressed_context") or state.get("retrieved_context", [])
     sources = state.get("sources_used", [])
 
-    # Chunks are already priority-sorted by the retriever; tail drops lowest-priority first
     context = "\n\n---\n\n".join(chunks) if chunks else "No external context retrieved."
     if len(context) > 12000:
         logger.warning(f"[rag:{ticker}] context truncated: {len(context)} → 12000 chars")
@@ -562,43 +586,33 @@ def response_generator(state: EquityRAGState) -> dict:
     }
 
 
-# ── Node 7 — Relevance Checker (context-grounded) ────────────────────────
-# Previously: LLM graded its own response (self-evaluation bias).
-# Now: LLM grades response against the retrieved context (faithfulness check).
+# ── Node 8 — Relevance Checker + Guardrails ───────────────────────────────────
 
 _RELEVANCE_PROMPT = _make_prompt([
-    ("system", """You are a quality-assurance judge for equity research.
-Evaluate whether the generated answer is faithfully grounded in the retrieved context below.
+    ("system", """You are a QA judge for equity research — context-faithfulness check.
+Score whether the generated answer is grounded in the retrieved context.
 
-CRITICAL: A response that sounds correct but uses figures NOT present in the retrieved
-context should score LOW. You are testing context-faithfulness, not general correctness.
+1.0 — All figures explicitly in context; directly answers query
+0.8 — Mostly grounded; minor citation gaps
+0.6 — Partially grounded; some figures unsupported
+0.4 — Mostly parametric / not context-grounded
+< 0.4 — Contradicts context or ignores it
 
-Score 0.0 to 1.0:
-  1.0 — All cited figures explicitly appear in the context; answer directly addresses the query
-  0.8 — Most figures are in context; minor gaps in citation specificity
-  0.6 — Partially grounded; some figures not supported by context or wrong period
-  0.4 — Mostly from LLM knowledge rather than the provided context
-  < 0.4 — Contradicts context, or the context was ignored entirely
+Threshold: {threshold}
 
-Acceptance threshold: {threshold}
-
-Retrieved Context (first 3,000 chars for grounding check):
+Retrieved Context (first 3,000 chars):
 {context_preview}
 
-Respond with ONLY valid JSON:
+Respond ONLY valid JSON:
 {{"is_relevant": true/false, "score": <0.0–1.0>,
-  "feedback": "<what was missing or mis-grounded — be specific about which figures lacked context support>"}}"""),
-    ("human", """Original query: {original_query}
-Company: {company_name} ({ticker})
-Generated response: {response}"""),
+  "feedback": "<specific figures lacking context support>"}}"""),
+    ("human", "Original query: {original_query}\nCompany: {company_name} ({ticker})\nResponse: {response}"),
 ])
 
 
 def relevance_checker(state: EquityRAGState) -> dict:
     ticker  = state.get("ticker", "UNKNOWN")
-    chunks  = state.get("retrieved_context", [])
-
-    # Provide a representative slice of context for faithfulness grading
+    chunks  = state.get("compressed_context") or state.get("retrieved_context", [])
     context_preview = "\n\n".join(chunks[:3])[:3000] if chunks else "No context retrieved."
 
     result = (_RELEVANCE_PROMPT | _llm()).invoke({
@@ -614,23 +628,74 @@ def relevance_checker(state: EquityRAGState) -> dict:
     relevant = bool(parsed.get("is_relevant", score >= RELEVANCE_THRESHOLD))
     feedback = parsed.get("feedback", "")
 
-    logger.debug(f"[rag:{ticker}] relevance score={score:.2f} accepted={relevant}")
+    # Guardrails
+    groundedness_score  = 0.0
+    confidence_score    = 0.0
+    hallucinated_claims: list[str] = []
+    if chunks and state.get("response"):
+        try:
+            from .guardrails import GuardrailsChecker
+            checker = GuardrailsChecker(
+                llm_fn=_llm_fn,
+                groundedness_threshold=RAG_CONFIG.groundedness_threshold,
+            )
+            retrieval_quality = min(1.0, len(chunks) / max(TOP_K, 1))
+            gr = checker.check(
+                query              = state.get("original_query", ""),
+                response           = state.get("response", ""),
+                context_chunks     = chunks,
+                relevance_score    = score,
+                retrieval_quality  = retrieval_quality,
+            )
+            groundedness_score  = gr.groundedness_score
+            confidence_score    = gr.confidence_score
+            hallucinated_claims = gr.hallucinated_numbers + gr.unsupported_claims
+        except Exception as exc:
+            logger.debug(f"[rag] guardrails check failed ({exc})")
+
+    logger.debug(
+        f"[rag:{ticker}] relevance={score:.2f} grounded={groundedness_score:.2f} "
+        f"confidence={confidence_score:.2f} accepted={relevant}"
+    )
 
     if relevant:
+        # Persist exchange in conversation memory
+        session_id = state.get("session_id", "")
+        if session_id:
+            try:
+                from .memory import ConversationStore
+                ConversationStore.get().add_exchange(
+                    session_id = session_id,
+                    question   = state.get("original_query", ""),
+                    answer     = state.get("response", ""),
+                    sources    = state.get("sources_used", []),
+                    llm_fn     = _llm_fn,
+                    max_chars  = RAG_CONFIG.memory_max_chars,
+                    max_turns  = RAG_CONFIG.memory_max_turns,
+                )
+            except Exception:
+                pass
+
         return {
             "is_relevant":        True,
             "relevance_score":    score,
             "relevance_feedback": feedback,
+            "groundedness_score": groundedness_score,
+            "confidence_score":   confidence_score,
+            "hallucinated_claims": hallucinated_claims,
             "final_response":     state.get("response", ""),
         }
+
     return {
         "is_relevant":        False,
         "relevance_score":    score,
         "relevance_feedback": feedback,
+        "groundedness_score": groundedness_score,
+        "confidence_score":   confidence_score,
     }
 
 
-# ── Routing ───────────────────────────────────────────────────────────────
+# ── Routing ───────────────────────────────────────────────────────────────────
 
 def _route_after_detail(state: EquityRAGState) -> str:
     return "source_selector" if state.get("needs_retrieval", True) else "response_generator"
@@ -645,7 +710,7 @@ def _route_after_relevance(state: EquityRAGState) -> str:
     return "query_rewriter"
 
 
-# ── Graph ─────────────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 
 _compiled     = None
 _compile_lock = threading.Lock()
@@ -664,6 +729,7 @@ def _get_graph():
         g.add_node("detail_checker",     detail_checker)
         g.add_node("source_selector",    source_selector)
         g.add_node("retriever",          retriever)
+        g.add_node("context_compressor", context_compressor)
         g.add_node("response_generator", response_generator)
         g.add_node("relevance_checker",  relevance_checker)
 
@@ -671,7 +737,8 @@ def _get_graph():
         g.add_edge("query_rewriter",     "query_decomposer")
         g.add_edge("query_decomposer",   "detail_checker")
         g.add_edge("source_selector",    "retriever")
-        g.add_edge("retriever",          "response_generator")
+        g.add_edge("retriever",          "context_compressor")
+        g.add_edge("context_compressor", "response_generator")
         g.add_edge("response_generator", "relevance_checker")
 
         g.add_conditional_edges(
@@ -687,16 +754,19 @@ def _get_graph():
     return _compiled
 
 
-# ── Public API ────────────────────────────────────────────────────────────
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def run(
     question:     str,
     company_name: str = "",
     ticker:       str = "UNKNOWN",
+    session_id:   str = "",
 ) -> dict:
     """
-    Run the full equity RAG pipeline for one question about a company.
-    Returns the final state dict with `final_response`, `sources_used`, `relevance_score`.
+    Run the full equity RAG pipeline synchronously.
+    Includes HyDE, context compression, memory, and guardrails.
+    Returns state dict with `final_response`, `sources_used`, `relevance_score`,
+    `confidence_score`, `groundedness_score`.
     """
     if not _HAS_LANGCHAIN:
         raise RuntimeError(
@@ -705,12 +775,14 @@ def run(
             "and set at least one LLM API key in .env"
         )
     from ..core.config import validate_llm_config
-    validate_llm_config()   # raises RuntimeError with instructions if no provider configured
+    validate_llm_config()
+
     app         = _get_graph()
     final_state = app.invoke({
         "original_query": question,
         "company_name":   company_name,
         "ticker":         ticker.upper(),
+        "session_id":     session_id,
         "iteration":      0,
         "messages":       [],
         "sub_queries":    [question],
@@ -719,6 +791,83 @@ def run(
     if not final_state.get("final_response") and final_state.get("response"):
         final_state["final_response"] = final_state["response"]
     return final_state
+
+
+async def stream_run(
+    question:     str,
+    company_name: str = "",
+    ticker:       str = "UNKNOWN",
+    session_id:   str = "",
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator that yields tokens as they are generated.
+    Runs the pipeline up to the response_generator stage, then streams the
+    final LLM response token by token for SSE delivery.
+    """
+    if not _HAS_LANGCHAIN:
+        raise RuntimeError("LangChain not installed")
+    from ..core.config import validate_llm_config
+    validate_llm_config()
+
+    # Run pipeline phases 1–6 synchronously to get compressed context
+    app   = _get_graph()
+    state: EquityRAGState = {
+        "original_query": question,
+        "company_name":   company_name,
+        "ticker":         ticker.upper(),
+        "session_id":     session_id,
+        "iteration":      0,
+        "messages":       [],
+        "sub_queries":    [question],
+        "is_multi_hop":   False,
+    }
+
+    # Run nodes 1–6 (up to but not including response_generator)
+    for node_fn in (query_rewriter, query_decomposer, detail_checker):
+        state.update(node_fn(state))
+
+    if state.get("needs_retrieval", True):
+        state.update(source_selector(state))
+        state.update(retriever(state))
+        state.update(context_compressor(state))
+
+    # Stream the final generation
+    chunks  = state.get("compressed_context") or state.get("retrieved_context", [])
+    sources = state.get("sources_used", [])
+    context = "\n\n---\n\n".join(chunks) if chunks else "No external context retrieved."
+    if len(context) > 12000:
+        context = context[:12000] + "\n\n[... truncated ...]"
+
+    system_msg = (
+        f"You are a senior equity research analyst. Answer using the retrieved context. "
+        f"Company: {company_name} ({ticker}). Sources: {', '.join(sources) or 'parametric'}"
+    )
+    user_msg = f"Context:\n{context}\n\nQuestion: {question}"
+
+    # LangChain streaming
+    llm     = _llm()
+    prompt  = _make_prompt([("system", system_msg), ("human", "{user}")])
+    full    = prompt | llm
+
+    full_response = ""
+    async for chunk in full.astream({"user": user_msg}):
+        token = getattr(chunk, "content", str(chunk))
+        if token:
+            full_response += token
+            yield token
+
+    # Post-stream: save to memory
+    if session_id and full_response:
+        try:
+            from .memory import ConversationStore
+            ConversationStore.get().add_exchange(
+                session_id=session_id, question=question, answer=full_response,
+                sources=sources, llm_fn=_llm_fn,
+                max_chars=RAG_CONFIG.memory_max_chars,
+                max_turns=RAG_CONFIG.memory_max_turns,
+            )
+        except Exception:
+            pass
 
 
 def query(

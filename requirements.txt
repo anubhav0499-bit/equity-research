@@ -45,7 +45,7 @@ rich>=13.7.0
 
 # ── RAG / Embeddings ───────────────────────────────────────────────
 sentence-transformers>=3.0.0
-chromadb>=0.5.0
+rank-bm25>=0.2.2
 
 # ── LangChain stack (RAG pipeline + tool wrappers) ─────────────────
 langchain>=0.3.0
@@ -57,10 +57,9 @@ langchain-google-genai>=2.0.0
 langchain-groq>=0.2.0
 langchain-ollama>=0.2.0
 
-# ── LlamaIndex (optimised vector retrieval) ────────────────────────
-llama-index-core>=0.11.0
-llama-index-embeddings-huggingface>=0.3.0
-llama-index-vector-stores-chroma>=0.2.0
+# ── Cross-encoder re-ranking ───────────────────────────────────────
+# ms-marco-MiniLM-L-6-v2 downloaded automatically via sentence-transformers
+# No additional package required.
 
 # ── Web search tools ───────────────────────────────────────────────
 tavily-python>=0.5.0
@@ -70,8 +69,9 @@ duckduckgo-search>=6.0.0
 pdfminer.six>=20221105
 pypdf>=4.0.0
 
-# ── Workflow ───────────────────────────────────────────────────────
+# ── Workflow / Streaming ───────────────────────────────────────────
 langgraph>=0.2.0
+sse-starlette>=1.6.0
 
 # ── Statistics ─────────────────────────────────────────────────────
 scipy>=1.13.0

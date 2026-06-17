@@ -4,10 +4,15 @@ Equity Research RAG Platform — Production HTTP API
 Endpoints
 ---------
 GET  /health          Liveness + dependency check (LLM, vector store, model)
-POST /query           Run RAG pipeline for one analyst question
+POST /query           Run RAG pipeline for one analyst question (sync)
+POST /stream          Stream RAG response token-by-token via SSE
 POST /ingest          Ingest a document into the per-ticker vector store
 GET  /collection/{t}  Chunk count for a ticker's knowledge base
 DELETE /collection/{t} Drop a ticker's knowledge base
+
+SSE streaming format (POST /stream):
+    Each event: data: <token>\\n\\n
+    Final event: data: [DONE]\\n\\n
 
 Run:
     uvicorn equity_research.api.server:app --host 0.0.0.0 --port 8000 --workers 2
@@ -15,12 +20,13 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 
@@ -66,14 +72,25 @@ class QueryRequest(BaseModel):
     question:     str        = Field(..., min_length=3, max_length=2000)
     ticker:       str        = Field(..., min_length=1, max_length=10)
     company_name: str        = Field("", max_length=200)
+    session_id:   str        = Field("", max_length=128,
+                                     description="Opaque session ID for conversation memory. "
+                                                 "Leave blank for stateless queries.")
+
+class StreamQueryRequest(BaseModel):
+    question:     str        = Field(..., min_length=3, max_length=2000)
+    ticker:       str        = Field(..., min_length=1, max_length=10)
+    company_name: str        = Field("", max_length=200)
+    session_id:   str        = Field("", max_length=128)
 
 class QueryResponse(BaseModel):
-    question:        str
-    ticker:          str
-    answer:          str
-    sources_used:    list[str]
-    relevance_score: float
-    latency_ms:      float
+    question:           str
+    ticker:             str
+    answer:             str
+    sources_used:       list[str]
+    relevance_score:    float
+    confidence_score:   float  = 0.0
+    groundedness_score: float  = 0.0
+    latency_ms:         float
 
 class IngestRequest(BaseModel):
     ticker:   str            = Field(..., min_length=1, max_length=10)
@@ -159,6 +176,7 @@ async def rag_query(req: QueryRequest) -> QueryResponse:
             question     = req.question,
             company_name = req.company_name or req.ticker,
             ticker       = req.ticker.upper(),
+            session_id   = req.session_id,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -172,12 +190,59 @@ async def rag_query(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500, detail="Pipeline returned empty response")
 
     return QueryResponse(
-        question        = req.question,
-        ticker          = req.ticker.upper(),
-        answer          = answer,
-        sources_used    = result.get("sources_used", []),
-        relevance_score = result.get("relevance_score", 0.0),
-        latency_ms      = round(latency_ms, 1),
+        question           = req.question,
+        ticker             = req.ticker.upper(),
+        answer             = answer,
+        sources_used       = result.get("sources_used", []),
+        relevance_score    = result.get("relevance_score", 0.0),
+        confidence_score   = result.get("confidence_score", 0.0),
+        groundedness_score = result.get("groundedness_score", 0.0),
+        latency_ms         = round(latency_ms, 1),
+    )
+
+
+@app.post("/stream")
+async def rag_stream(req: StreamQueryRequest) -> StreamingResponse:
+    """
+    Stream the RAG response token-by-token using Server-Sent Events (SSE).
+
+    Each SSE event carries one token:
+        data: <token>\\n\\n
+
+    The final event signals completion:
+        data: [DONE]\\n\\n
+
+    Clients should concatenate tokens until they receive [DONE].
+    """
+    try:
+        from ..retrieval.rag_pipeline import stream_run as _stream_run
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"RAG pipeline unavailable: {e}")
+
+    async def _event_generator() -> AsyncGenerator[str, None]:
+        try:
+            async for token in _stream_run(
+                question     = req.question,
+                company_name = req.company_name or req.ticker,
+                ticker       = req.ticker.upper(),
+                session_id   = req.session_id,
+            ):
+                # Escape newlines in token so SSE framing stays intact
+                safe_token = token.replace("\n", "\\n")
+                yield f"data: {safe_token}\n\n"
+        except Exception as exc:
+            logger.exception(f"[api] /stream error: {exc}")
+            yield f"data: [ERROR] {exc}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx proxy buffering
+        },
     )
 
 
