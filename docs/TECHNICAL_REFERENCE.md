@@ -1,7 +1,7 @@
 # Equity Intelligence Research Platform — Technical Reference
 
 > **Handover document.** Covers architecture, configuration, data flow, deployment,
-> testing, and extension points. Written against commit `fbb6d4d` (2026-06-18).
+> testing, and extension points. Written against commit `ef6261d` (2026-06-18).
 
 ---
 
@@ -12,7 +12,7 @@
 3. [Setup & Installation](#3-setup--installation)
 4. [Configuration Reference](#4-configuration-reference)
 5. [LLM Provider Cascade](#5-llm-provider-cascade)
-6. [17-Agent Pipeline](#6-17-agent-pipeline)
+6. [20-Agent CIO Pipeline](#6-20-agent-cio-pipeline)
 7. [RAG Subsystem](#7-rag-subsystem)
 8. [FastAPI HTTP Server](#8-fastapi-http-server)
 9. [Forensic Scoring Models](#9-forensic-scoring-models)
@@ -1185,7 +1185,7 @@ Use `PyMuPDF` (`fitz.open(path).get_text("text")`) for extraction.
 
 ### Minimum requirements
 
-- [ ] Python 3.10+, 8 GB RAM
+- [ ] Python 3.10+, 4 GB RAM minimum
 - [ ] At least one LLM API key set in `.env`
 - [ ] `pip install -r requirements.txt` completed without errors
 - [ ] `python main.py --check` shows all `✓`
@@ -1329,4 +1329,4 @@ while (true) {
 ---
 
 *Document updated: 2026-06-18. Maintained in `docs/TECHNICAL_REFERENCE.md`.*
-*Current commit: `fbb6d4d`. Platform repo: https://github.com/anubhav0499-bit/equity-research*
+*Current commit: `ef6261d`. Platform repo: https://github.com/anubhav0499-bit/equity-research*

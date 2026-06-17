@@ -1,9 +1,10 @@
 # Equity Research Platform — Retrieval Subsystem Reference
 
-The `retrieval/` package provides the multi-agent RAG pipeline embedded inside
-the equity research platform. It is called automatically during each research run
-(filings and transcripts are indexed in Phases A2 and B) and is accessible to
-every agent via `self.rag_query(question, state)`.
+The `retrieval/` package provides the full RAG pipeline embedded inside the equity
+research platform. It is called automatically during each research run (filings and
+transcripts are indexed in Phases A2 and B) and is accessible to every agent via
+`self.rag_query(question, state)`. It can also be called standalone via the HTTP API
+or directly from Python.
 
 For manual ingestion of additional documents:
 ```bash
@@ -16,503 +17,488 @@ python -m equity_research.retrieval.ingest --ticker AAPL --status
 
 ## Overview
 
-The retrieval subsystem is a multi-agent RAG pipeline built on three
-complementary frameworks integrated into the 17-agent research workflow:
+The retrieval subsystem is a 9-node LangGraph pipeline integrated into the 20-agent
+research workflow. Key design decisions vs. a naive RAG setup:
 
-| Layer | Library | Role |
+| Layer | Library / Model | Role |
 |---|---|---|
-| Orchestration | **LangGraph** | State machine, conditional routing, retry loops |
-| Retrieval | **LlamaIndex** | Optimised chunking, embedding, and semantic retrieval |
-| Tools & LLMs | **LangChain** | LLM abstraction, tool wrappers, prompt templates |
-| Embeddings | HuggingFace `bge-large-en-v1.5` | Local embeddings — no API key required |
-| Vector store | ChromaDB | Persistent on-disk, one collection per company ticker |
+| Orchestration | **LangGraph** | 9-node state machine, conditional routing, retry loops |
+| Embeddings | `BAAI/bge-small-en-v1.5` (~130 MB local) | Dense vector encoding; L2-normalised for cosine sim |
+| Vector store | **FAISS** `IndexFlatIP` | Per-ticker persistent child + parent dual indices |
+| Chunking | **SmartChunker** | Recursive / contextual / semantic — auto-detected per doc |
+| Hybrid retrieval | **BM25 + RRF** | Keyword scoring merged with dense rank via Reciprocal Rank Fusion |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Precision re-scoring of the candidate pool |
+| Query enhancement | **HyDE** | Hypothetical doc embedding blended 50/50 with query vector |
+| Compression | **ContextCompressor** | Keyword filter → LLM extraction → Jaccard dedup |
+| Memory | **ConversationStore** | Session-keyed sliding window with LLM rolling summary |
+| Guardrails | **GuardrailsChecker** | Rule-based + LLM faithfulness + composite confidence score |
+| Evaluation | **RAGASEvaluator** | Context relevance, faithfulness, answer relevance (geometric mean) |
+| Tools | LangChain `@tool` wrappers | SEC EDGAR, web search, Wikipedia, yfinance, calculator |
+| Streaming | FastAPI `StreamingResponse` | SSE token-by-token delivery via `stream_run()` |
 
 ---
 
 ## Architecture
 
 ```
-User Query
+User Query (+ session_id for memory)
     │
     ▼
-[1] Query Rewriter        — Optimises the raw query for retrieval
+[1] query_rewriter        — Optimise query + inject conversation history
+    │                       + generate HyDE embedding on iteration 1
+    ▼
+[2] query_decomposer      — Detect multi-hop; split compound questions
     │
     ▼
-[2] Detail Checker        — Decides: answer from parametric knowledge or retrieve?
-    ├── No retrieval needed ──────────────────────────────────────────────┐
-    │                                                                     │
-    ▼                                                                     │
-[3] Source Selector       — Picks the best source(s)                     │
-    │                                                                     │
-    ▼                                                                     │
-[4] Retriever             — Fetches context from the selected source(s)  │
-    │                                                                     │
-    └──────────────────────────────────────────────────────────────────── ▼
-                                                                   [5] Response Generator
-                                                                          │
-                                                                          ▼
-                                                                   [6] Relevance Checker
-                                                                     ├── Score ≥ threshold → Final Response
-                                                                     └── Score < threshold → back to [1] (max 5 loops)
+[3] detail_checker        — Router: retrieval needed? or parametric LLM?
+    ├── No  ────────────────────────────────────────────────────────────┐
+    │                                                                   │
+    ▼ Yes                                                               │
+[4] source_selector       — Agentic: plan retrieval strategy           │
+    │                       produces `retrieval_plan` (ordered steps)  │
+    ▼                                                                   │
+[5] retriever             — Parallel multi-source fetch                │
+    │                       vector_db / internet / tools_apis          │
+    ▼                                                                   │
+[6] context_compressor    — LLM extraction + Jaccard dedup             │
+    │                                                                   │
+    └─────────────────────────────────────────────── [7] response_generator
+                                                              │
+                                                              ▼
+                                                     [8] relevance_checker
+                                                         + GuardrailsChecker
+                                                         (groundedness + confidence)
+                                                              │
+                                                    ┌─────────┴──────────┐
+                                               score ≥ threshold     score < threshold
+                                                    │                    │  (max 5 loops)
+                                                    ▼                    ▼
+                                              save to memory      query_rewriter [1]
+                                                    │
+                                                    ▼
+                                               final_response
 ```
 
-The graph is compiled once at import time (`graph.py`) and shared across all calls.
-LangGraph merges partial state dicts from each node — nodes only return the fields
-they modify, everything else is inherited from the prior state.
-
 ---
 
-## Node Reference
+## Module Reference
 
-### Node 1 — Query Rewriter (`query_rewriter`)
+### `retrieval/chunking.py` — SmartChunker
 
-**Purpose:** Transform the raw user query into the most effective retrieval query.
+Three splitting strategies, selected manually or via auto-detect:
 
-**Inputs from state:**
-- `original_query` — the user's verbatim input
-- `rewritten_query` — the previous rewrite (on loop iterations > 1)
-- `relevance_feedback` — the relevance checker's critique from the previous iteration
-
-**Outputs to state:**
-- `rewritten_query` — the optimised retrieval query
-- `iteration` — incremented by 1 each pass
-
-**Behaviour:** Expands abbreviations, adds synonyms, strips filler words, and on
-retry iterations incorporates `relevance_feedback` to address what was missing.
-
-**Prompt key:** `_REWRITE_PROMPT`
-
----
-
-### Node 2 — Detail Checker (`detail_checker`)
-
-**Purpose:** Decide whether the LLM can answer reliably from parametric knowledge
-alone, or whether external retrieval is needed.
-
-**Inputs from state:**
-- `rewritten_query`
-
-**Outputs to state:**
-- `needs_retrieval: bool`
-- `retrieval_reason: str`
-
-**When retrieval is NOT needed:**
-- General explanations and definitions
-- Widely-known historical facts
-- Reasoning, summarisation, or creative tasks
-
-**When retrieval IS needed:**
-- Real-time or recent information (prices, news, events)
-- Specific documents the user has ingested
-- Precise facts the LLM may hallucinate
-- Domain-specific data (medical, legal, financial)
-
-**Routing:** If `needs_retrieval = False` → jumps directly to Node 5. Otherwise → Node 3.
-
-**Prompt key:** `_DETAIL_PROMPT`
-
----
-
-### Node 3 — Source Selector (`source_selector`)
-
-**Purpose:** Choose which retrieval source(s) will best satisfy the query.
-
-**Inputs from state:**
-- `rewritten_query`
-- `retrieval_reason`
-- live `collection_size()` from the vector store
-
-**Outputs to state:**
-- `selected_source: str` — one of `"vector_db"`, `"internet"`, `"tools_apis"`, `"combined"`
-- `source_rationale: str`
-
-**Source logic:**
-
-| Value | Description | Use when |
+| Strategy | Trigger heuristic | Behaviour |
 |---|---|---|
-| `vector_db` | ChromaDB local knowledge base | Query is about ingested documents / PDFs |
-| `internet` | Tavily (preferred) or DuckDuckGo | Time-sensitive, current events, live data |
-| `tools_apis` | Wikipedia + calculator + URL fetcher | Encyclopaedic facts, arithmetic, specific URLs |
-| `combined` | All three sources in sequence | Complex queries needing background + real-time data |
+| `contextual` | Header density > 2 per 50 lines | Splits on 10-K section headers (`ITEM`, `PART`, `MD&A`, `Risk Factors`); stores `section_header` in chunk metadata |
+| `recursive` | High number density or default | Hierarchical separator: `\n\n` → `\n` → `. ` → ` ` |
+| `semantic` | Low number density + long avg line length | Embedding-similarity boundary detection; falls back to `recursive` if embed_fn unavailable |
 
-**Prompt key:** `_SOURCE_PROMPT`
+**Auto-detect (`auto_detect_strategy`):**
+1. Header density > 2 per 50 lines → `contextual`
+2. Avg line length > 120 chars → `semantic`
+3. Otherwise → `recursive`
 
----
-
-### Node 4 — Retriever (`retriever`)
-
-**Purpose:** Execute the retrieval strategy and collect raw context chunks.
-
-**Inputs from state:**
-- `rewritten_query`
-- `selected_source`
-
-**Outputs to state:**
-- `retrieved_context: list[str]` — raw text chunks
-- `retrieval_metadata: list[dict]` — per-chunk provenance (`{"source": "vector_db"}` etc.)
-- `sources_used: list[str]` — de-duplicated list of source names
-
-**Internal dispatch:**
-
-```
-"vector_db"   → vs.retrieve(query, top_k=TOP_K)
-"internet"    → T.web_search.run(query)
-"tools_apis"  → T.wikipedia_lookup.run(query)
-"combined"    → all three in sequence
-```
-
-The retriever does not call the LLM — it is a pure I/O node.
-
----
-
-### Node 5 — Response Generator (`response_generator`)
-
-**Purpose:** Synthesise a candidate answer from the query and retrieved context.
-
-**Inputs from state:**
-- `rewritten_query`
-- `retrieved_context` — joined with `"\n\n---\n\n"` separators
-- `sources_used`
-
-**Outputs to state:**
-- `response: str` — the candidate answer
-- `messages` — appended with an `AIMessage`
-
-**Context handling:**
-Context is capped at 12,000 characters. If truncated, a `[... content truncated for length ...]`
-marker is appended and a warning is logged so the model knows its context is partial.
-
-**Prompt key:** `_RESPONSE_PROMPT`
-
----
-
-### Node 6 — Relevance Checker (`relevance_checker`)
-
-**Purpose:** Self-assess whether the candidate answer adequately addresses the query.
-
-**Inputs from state:**
-- `original_query`
-- `rewritten_query`
-- `response`
-
-**Outputs to state:**
-- `is_relevant: bool`
-- `relevance_score: float` — 0.0 to 1.0
-- `relevance_feedback: str` — critique for the rewriter on failure
-- `final_response: str` — set only when `is_relevant = True`
-
-**Scoring rubric:**
-
-| Score | Meaning |
-|---|---|
-| 1.0 | Perfectly answers the question, well-structured, sources cited |
-| 0.8 | Good answer, minor gaps |
-| 0.6 | Partially answers, misses key aspects |
-| 0.4 | Vague, off-topic, or factually questionable |
-| < 0.4 | Wrong, hallucinated, or completely irrelevant |
-
-**Routing:**
-- `is_relevant = True` → `END` (publishes `final_response`)
-- `is_relevant = False` and `iteration < MAX_ITERATIONS` → loops back to Node 1
-- `is_relevant = False` and `iteration >= MAX_ITERATIONS` → `END` with best available `response`
-
-**Prompt key:** `_RELEVANCE_PROMPT`
-
----
-
-## State Schema (`RAGState`)
-
-Defined in `state.py` as a `TypedDict` with `total=False` (all fields optional).
-LangGraph merges partial dicts — a node returning `{"rewritten_query": "x"}` does
-not overwrite any other field.
+**Multi-vector ingest:** parent chunks use `SmartChunker` in `auto` mode; child chunks always use `recursive` (precision over strategy).
 
 ```python
-class RAGState(TypedDict, total=False):
-    # Input
-    original_query: str           # user's raw query, never modified
+from equity_research.retrieval.chunking import SmartChunker
 
-    # Node 1 outputs
-    rewritten_query: str          # optimised query
-    iteration: int                # current loop count (1-based)
-
-    # Node 2 outputs
-    needs_retrieval: bool
-    retrieval_reason: str
-
-    # Node 3 outputs
-    selected_source: str          # "vector_db" | "internet" | "tools_apis" | "combined"
-    source_rationale: str
-
-    # Node 4 outputs
-    retrieved_context: list[str]
-    retrieval_metadata: list[dict]
-    sources_used: list[str]
-
-    # Node 5 outputs
-    response: str                 # candidate answer
-
-    # Node 6 outputs
-    is_relevant: bool
-    relevance_score: float
-    relevance_feedback: str
-
-    # Conversation log (merged via add_messages, never overwritten)
-    messages: Annotated[list[BaseMessage], add_messages]
-
-    # Final output
-    final_response: str           # set when relevance check passes
+chunker = SmartChunker(mode="auto", chunk_size=512)
+texts, metadatas = chunker.split(filing_text, base_metadata={"doc_type": "10-K"})
 ```
-
-The `messages` field uses LangGraph's `add_messages` reducer — new messages are
-appended rather than replacing the existing list.
 
 ---
 
-## LLM Configuration (`config.py`)
+### `retrieval/vector_store.py` — FAISS Multi-Vector Store
 
-### Provider Auto-Detection
+**Storage:** `data/faiss_index/<TICKER>/` — four files per ticker:
 
-`get_llm()` checks environment variables in this order and returns the first match:
+| File | Contents |
+|---|---|
+| `child_index.faiss` | FAISS `IndexFlatIP` over child (256-token) embeddings |
+| `parent_index.faiss` | FAISS `IndexFlatIP` over parent (1024-token) embeddings |
+| `child_docs.json` | Child chunk texts + `parent_id` back-references |
+| `parent_docs.json` | Parent chunk texts + original metadata |
 
-1. `OPENAI_API_KEY` → `ChatOpenAI`
-2. `ANTHROPIC_API_KEY` → `ChatAnthropic`
-3. `GOOGLE_API_KEY` → `ChatGoogleGenerativeAI`
-4. `GROQ_API_KEY` → `ChatGroq`
-5. `AZURE_OPENAI_API_KEY` → `AzureChatOpenAI`
-6. `OLLAMA_BASE_URL` or `OLLAMA_MODEL` → `ChatOllama`
-7. No key found → `ChatOllama` (local Ollama, last resort)
+**Embedding:** `BAAI/bge-small-en-v1.5` (384-dim), L2-normalised before indexing so inner-product = cosine similarity. Fallback: `all-MiniLM-L6-v2`.
 
-### Supported Providers
+**Retrieval pipeline (per `query()` call):**
 
-| `LLM_PROVIDER` | Key env var | Model env var | Default model |
-|---|---|---|---|
-| `openai` | `OPENAI_API_KEY` | `OPENAI_MODEL` | `gpt-4o-mini` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` |
-| `google` | `GOOGLE_API_KEY` | `GOOGLE_MODEL` | `gemini-1.5-pro` |
-| `groq` | `GROQ_API_KEY` | `GROQ_MODEL` | `llama-3.1-70b-versatile` |
-| `azure` | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o` |
-| `ollama` | _(none)_ | `OLLAMA_MODEL` | `llama3.1` |
-
-### OpenAI-Compatible Endpoints
-
-Any vLLM, LM Studio, or custom endpoint works with the `openai` provider:
-
-```env
-LLM_PROVIDER=openai
-OPENAI_API_KEY=not-needed
-OPENAI_BASE_URL=http://localhost:8000/v1
-OPENAI_MODEL=your-model-name
+```
+1. Dense retrieval       — FAISS IndexFlatIP over child vectors
+                           candidates = max(top_k × 4, 20)
+                           optional: pass hyde_vec for blended HyDE embedding
+2. Parent lookup         — map child hits → parent chunk texts
+3. Metadata filter       — post-retrieval filter on any metadata field
+4. BM25 scoring          — rank-bm25 IDF-weighted term frequency per query term
+5. Reciprocal Rank Fusion — merge dense rank + BM25 rank (RRF constant = 60)
+6. Cross-encoder rerank  — ms-marco-MiniLM-L-6-v2; runs when candidates > top_k
+7. Return top-k parent chunks
 ```
 
-### Caching
-
-`get_llm()` is decorated with `@lru_cache(maxsize=None)`. Each unique `(temperature,)`
-argument is cached independently — the same LLM client object is reused across all
-nodes in a process lifetime.
-
----
-
-## Vector Store (`vector_store.py`)
-
-### Storage
-
-- **Backend:** ChromaDB `PersistentClient` — data survives process restarts
-- **Default path:** `./chroma_db` (overridden by `CHROMA_PERSIST_DIR`)
-- **Collection name:** `agentic_rag`
-- **Embeddings:** HuggingFace `bge-small-en-v1.5` (local, no API key needed)
-- **Chunk size:** 512 tokens, 64-token overlap (`SentenceSplitter`)
-
-### Singleton Initialisation
-
-The index, Chroma client, and collection are module-level globals, initialised
-lazily on the first call to any public API. A `threading.Lock` (double-checked
-locking) prevents race conditions under concurrent access.
-
-### Public API
+**Public API:**
 
 ```python
-# Add raw text strings
-ingest_texts(texts: list[str], metadatas: list[dict] | None = None) -> int
-
-# Add a file (PDF, TXT, MD, HTML)
-ingest_file(path: str | Path) -> int
-
-# Fetch and add a web page
-ingest_url(url: str) -> int
-
-# Semantic search
-retrieve(query: str, top_k: int = TOP_K) -> list[str]
-
-# Number of documents in the collection
-collection_size() -> int
+from equity_research.retrieval.vector_store import (
+    ingest_document,   # (text, metadata, ticker) → int (chunks added)
+    ingest_texts,      # (texts, metadatas, ticker) → int
+    query,             # (question, ticker, top_k, metadata_filter, hyde_vec) → list[str]
+    collection_size,   # (ticker) → int
+    clear_company,     # (ticker) → None
+)
 ```
-
-### System Documents
-
-On startup, `ensure_system_docs_ingested()` checks for a `.system_docs_loaded`
-sentinel file in `CHROMA_PERSIST_DIR`. If absent, all `.md` files in the `docs/`
-directory (relative to the package root) are ingested automatically, then the
-sentinel is written. This makes the system self-documenting — you can ask it
-questions about itself.
 
 ---
 
-## Tools Registry (`tools.py`)
+### `retrieval/hyde.py` — HyDE
 
-All tools are LangChain `@tool`-decorated functions and can be used directly by
-LLM agents or called from within retriever node via `.run()`.
+Hypothetical Document Embeddings improve retrieval on abstract/analytical queries where
+the query text is semantically distant from the answer's vocabulary (e.g. "How did Apple
+manage working capital?" vs. a document section titled "Cash Conversion Cycle").
 
-| Tool | Function | Use case |
+```
+query_text
+    │
+    ├── embed → query_vec
+    │
+    ├── LLM generates ~100-word hypothetical answer passage
+    │       └── embed → hypo_vec
+    │
+    └── blended_vec = 0.5 × query_vec + 0.5 × hypo_vec  (L2-normalised)
+                ↓
+        FAISS search with blended_vec
+```
+
+Only runs on iteration 1. Returns `None` on any failure — callers use plain query embedding.
+
+```python
+from equity_research.retrieval.hyde import HyDE
+
+hyde = HyDE(llm_fn=agent.llm_analyze, embed_fn=_embed)
+blended = hyde.embed("What drove APEX's margin expansion?", company_name="APEX", ticker="APEX")
+```
+
+---
+
+### `retrieval/compression.py` — ContextCompressor
+
+Reduces LLM context window by 50–70% before generation. Four stages:
+
+1. **Keyword filter** — drop chunks with < 10% query-term overlap
+2. **LLM extraction** — extract relevant sentences per chunk; `[IRRELEVANT]` → dropped
+3. **Jaccard dedup** — remove chunks with > 85% overlap on first 200 chars
+4. **Char budget** — truncate total to `compression_max_chars` (default 8 000)
+
+```python
+from equity_research.retrieval.compression import ContextCompressor
+
+compressor = ContextCompressor(llm_fn=agent.llm_analyze, keyword_threshold=0.10)
+result = compressor.compress(query, chunks, max_output_chars=8000)
+# result.compression_ratio, result.compressed_chunks
+```
+
+---
+
+### `retrieval/memory.py` — ConversationStore
+
+Session-keyed sliding window injected into `query_rewriter` so multi-turn
+questions ("What about the Q2 figure?") resolve without re-retrieval.
+
+**Compression:** when `total_chars > memory_max_chars`, older turns (keeping last 3
+verbatim) are LLM-summarised into a rolling `session.summary` string.
+
+```python
+from equity_research.retrieval.memory import ConversationStore
+
+store = ConversationStore.get()   # thread-safe singleton
+store.add_exchange(session_id="s1", question="...", answer="...", sources=["10-K"])
+context = store.get_context("s1", max_chars=3000)
+store.evict_stale(ttl_seconds=3600)
+```
+
+---
+
+### `retrieval/guardrails.py` — GuardrailsChecker
+
+Three-layer faithfulness check after every generation:
+
+| Layer | Method | Output field |
 |---|---|---|
-| `web_search` | Tavily → DuckDuckGo fallback | Live internet search |
-| `wikipedia_lookup` | Wikipedia API | Encyclopaedic facts, definitions |
-| `vector_db_search` | Wraps `vs.retrieve()` | Query local knowledge base |
-| `fetch_url` | `requests` + BeautifulSoup | Scrape any URL |
-| `calculator` | AST-safe eval | Arithmetic and unit conversions |
+| Rule-based | Regex-extract numbers + dates from response; check presence in context | `hallucinated_numbers`, `rule_score` |
+| LLM faithfulness | Ask LLM to identify unsupported factual claims | `unsupported_claims`, `llm_score` |
+| Composite confidence | `0.40×groundedness + 0.35×relevance + 0.25×retrieval_quality` | `confidence_score` |
 
-All tools are exported as `ALL_TOOLS = [web_search, wikipedia_lookup, vector_db_search, fetch_url, calculator]`.
+`grounded = True` when `groundedness_score ≥ RAG_CONFIG.groundedness_threshold` (default 0.70).
+Both scores are returned in the `/query` API response.
 
-### Web Search Fallback
+```python
+from equity_research.retrieval.guardrails import GuardrailsChecker
 
-`_get_search()` is a lazy singleton. If `TAVILY_API_KEY` is set, it returns
-`TavilySearchResults(max_results=8)`. Otherwise it falls back to
-`DuckDuckGoSearchResults(num_results=8)` — no key required.
-
-### Wikipedia Singleton
-
-`_get_wiki()` constructs `WikipediaQueryRun` once and caches it. Top-2 results,
-4,000 character cap per article.
-
-### Calculator
-
-Uses `ast.parse` + a safe `_eval()` walker that only allows `ast.Constant`,
-`ast.BinOp`, `ast.UnaryOp`, and `ast.Expression` nodes. All other node types
-raise `ValueError`. Supports `+`, `-`, `*`, `/`, `//`, `%`, `**`.
+checker = GuardrailsChecker(llm_fn=agent.llm_analyze, groundedness_threshold=0.70)
+result = checker.check(query, response, context_chunks,
+                       relevance_score=0.88, retrieval_quality=0.9)
+print(result.confidence_score, result.grounded)
+```
 
 ---
 
-## Graph Wiring (`graph.py`)
+### `retrieval/evaluation.py` — RAGASEvaluator
 
-```
-Entry: query_rewriter
-  ↓  (edge)
-detail_checker
-  ↓  (conditional)
-  ├── needs_retrieval=True  → source_selector → retriever → response_generator
-  └── needs_retrieval=False ──────────────────────────────→ response_generator
-                                                               ↓  (edge)
-                                                         relevance_checker
-                                                               ↓  (conditional)
-                                                  ├── is_relevant=True / max_iter → END
-                                                  └── is_relevant=False → query_rewriter
-```
+LLM-as-judge RAGAS metrics — no `ragas` package required. Disabled by default
+(`RAG_CONFIG.ragas_enabled = False`); enable for offline evaluation runs.
 
-The compiled graph is stored in the module-level `_compiled` variable and built
-once on the first call to `get_graph()`.
-
-### `run(query: str) -> dict`
-
-Calls `app.invoke()`, returns the complete final state dict. If `final_response`
-is absent (max iterations exhausted without acceptance), falls back to `response`.
-
-### `stream(query: str) -> Iterator[tuple[str, dict]]`
-
-Calls `app.stream()`, yields `(node_name, partial_state_update)` tuples. Use
-`--stream` CLI flag or `run_streaming()` in `main.py` to see live pipeline trace.
-
----
-
-## Configuration Reference (`.env`)
-
-| Variable | Default | Description |
+| Metric | Judges | Aggregation |
 |---|---|---|
-| `LLM_PROVIDER` | _(auto-detect)_ | Force a specific provider: `openai`, `anthropic`, `google`, `groq`, `azure`, `ollama` |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `OPENAI_API_KEY` | — | OpenAI (or compatible) API key |
-| `OPENAI_BASE_URL` | _(OpenAI default)_ | Custom base URL for OpenAI-compatible endpoints |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Model name for OpenAI provider |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Model name for Anthropic provider |
-| `GOOGLE_API_KEY` | — | Google Generative AI key |
-| `GOOGLE_MODEL` | `gemini-1.5-pro` | Model for Google provider |
-| `GROQ_API_KEY` | — | Groq API key |
-| `GROQ_MODEL` | `llama-3.1-70b-versatile` | Model for Groq provider |
-| `AZURE_OPENAI_API_KEY` | — | Azure OpenAI key |
-| `AZURE_OPENAI_ENDPOINT` | — | Azure endpoint URL |
-| `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o` | Azure deployment name |
-| `AZURE_OPENAI_API_VERSION` | `2024-08-01-preview` | Azure API version |
-| `OLLAMA_MODEL` | `llama3.1` | Model name for Ollama |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `TAVILY_API_KEY` | — | Tavily search key (omit to use DuckDuckGo) |
-| `MAX_ITERATIONS` | `5` | Maximum query-rewrite loops before forcing an answer |
-| `TOP_K_RETRIEVAL` | `5` | Number of vector store chunks returned per query |
-| `RELEVANCE_THRESHOLD` | `0.7` | Minimum score for the relevance checker to accept an answer |
-| `CHROMA_PERSIST_DIR` | `./chroma_db` | Directory for the ChromaDB persistent store |
-| `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | HuggingFace embedding model |
+| `context_relevance` | Are retrieved chunks relevant to the question? | Per-chunk score 0–3, normalised to 0–1 |
+| `faithfulness` | Are response claims grounded in context? | `supported / total` claims |
+| `answer_relevance` | Does the response address the question? | Holistic 0–1 |
+| `ragas_score` | — | Geometric mean of all three |
+
+```python
+from equity_research.retrieval.evaluation import RAGASEvaluator
+
+evaluator = RAGASEvaluator(llm_fn=agent.llm_analyze)
+result = evaluator.evaluate(question, context_chunks, response)
+print(result.ragas_score)   # 0.0–1.0
+
+# Batch evaluation
+results = evaluator.evaluate_batch(questions, context_batches, responses)
+stats   = evaluator.summary_stats(results)
+```
 
 ---
 
-## CLI Reference
+### `retrieval/rag_pipeline.py` — 9-Node LangGraph Pipeline
 
-### `main.py` — Interactive Chat
+#### Node reference
 
-```bash
-# Interactive mode
-python main.py
+| # | Node | Key behaviour |
+|---|---|---|
+| 1 | `query_rewriter` | Normalise + expand; inject `ConversationStore` session context; generate HyDE embedding on iteration 1 |
+| 2 | `query_decomposer` | Detect multi-hop; split compound questions into `sub_queries` list |
+| 3 | `detail_checker` | Router: needs retrieval? or parametric LLM answer? |
+| 4 | `source_selector` | Agentic: outputs `selected_source` + `retrieval_plan` (ordered source list) |
+| 5 | `retriever` | Parallel dispatch to `vector_db` / `internet` / `tools_apis` / `combined`; dedup; priority sort |
+| 6 | `context_compressor` | `ContextCompressor.compress()` if `RAG_CONFIG.compression_enabled` |
+| 7 | `response_generator` | Synthesise grounded answer from `compressed_context` (or raw chunks) |
+| 8 | `relevance_checker` | Score answer vs. context; call `GuardrailsChecker`; save accepted exchange to `ConversationStore` |
 
-# One-shot query
-python main.py "What is LangGraph?"
+Max retry loops: 5. On each retry, `query_rewriter` SIMPLIFIES the query (not expands) to break low-relevance cycles.
 
-# Streaming pipeline trace
-python main.py --stream "Explain how transformers work"
+#### State schema (`EquityRAGState`)
+
+```python
+class EquityRAGState(TypedDict, total=False):
+    # Identity
+    company_name:        str
+    ticker:              str
+    session_id:          str          # links to ConversationStore
+
+    # Pipeline
+    original_query:      str
+    rewritten_query:     str
+    sub_queries:         list[str]
+    is_multi_hop:        bool
+    needs_retrieval:     bool
+    retrieval_reason:    str
+    selected_source:     str          # "vector_db" | "internet" | "tools_apis" | "combined"
+    retrieval_plan:      list[str]    # agentic ordered source steps
+    retrieved_context:   list[str]
+    retrieval_metadata:  list[dict]
+    compressed_context:  list[str]    # after context_compressor
+    response:            str
+    final_response:      str
+    sources_used:        list[str]
+
+    # Relevance + guardrails
+    is_relevant:         bool
+    relevance_score:     float
+    relevance_feedback:  str
+    groundedness_score:  float
+    confidence_score:    float
+    hallucinated_claims: list[str]
+    iteration:           int
+
+    # HyDE
+    hyde_embedding:      Optional[list]   # float list of blended embedding
+
+    # Conversation log
+    messages:            Annotated[list[BaseMessage], add_messages]
 ```
 
-**In-chat commands:**
+#### Entry points
 
-| Command | Effect |
-|---|---|
-| `/ingest <path>` | Index a local file (PDF, TXT, MD) or a URL |
-| `/clear` | Delete all documents from the vector store |
-| `/quit` | Exit |
+```python
+from equity_research.retrieval.rag_pipeline import run, stream_run
 
-### `ingest.py` — Document Ingestion
+# Synchronous — full 9-node pipeline
+result = run(
+    question     = "What was APEX FY2024 FCF?",
+    company_name = "APEX Technologies",
+    ticker       = "APEX",
+    session_id   = "analyst-1",   # optional; enables conversation memory
+)
+# Keys: final_response, sources_used, relevance_score,
+#       confidence_score, groundedness_score, hallucinated_claims
 
-```bash
-python ingest.py --file ./report.pdf
-python ingest.py --url https://arxiv.org/abs/1706.03762
-python ingest.py --text "Some raw text to index"
-python ingest.py --dir ./documents/          # recursive, .pdf/.txt/.md/.html
-python ingest.py --file ./data.pdf --metadata '{"source": "arxiv", "year": 2024}'
+# Streaming — runs nodes 1–6 synchronously then streams generation token-by-token
+async for token in stream_run(question, company_name, ticker, session_id):
+    print(token, end="", flush=True)
+
+# Convenience wrapper — returns just the answer string
+from equity_research.retrieval.rag_pipeline import query
+answer = query("What is APEX's gross margin?", ticker="APEX")
 ```
+
+---
+
+### `retrieval/tools.py` — LangChain Tool Wrappers
+
+| Tool | Function | Notes |
+|---|---|---|
+| `web_search` | Tavily (preferred) or DuckDuckGo fallback | Requires `TAVILY_API_KEY`; falls back silently |
+| `sec_edgar_search` | SEC EDGAR full-text search scoped to ticker | Uses `dateRange`/`startdt` params |
+| `financial_snapshot` | yfinance price / market-cap / P/E | No API key; cached by yfinance |
+| `wikipedia_lookup` | Wikipedia article summary | Gated by `_is_background_query` — only for background/overview queries |
+| `calculator` | AST-safe arithmetic evaluator | Blocks `eval`, lambdas, exponents > 10 000 |
+
+**Calculator security:** only `Num`, `BinOp` (+−×÷^), `UnaryOp`, and named `math.*`
+functions are allowed. String operands and `__import__` raise `ValueError`.
+
+**Wikipedia gating:** frozenset check on 30+ keywords (`history`, `founded`, `overview`,
+`sector`, `headquarters`, etc.). Financial-figure queries are never routed to Wikipedia.
+
+---
+
+## RAGConfig — All Hyperparameters
+
+All RAG settings live in one dataclass (`core/config.py`). Override at runtime:
+
+```python
+from equity_research.core.config import RAG_CONFIG
+RAG_CONFIG.top_k = 8
+RAG_CONFIG.hyde_enabled = False
+RAG_CONFIG.ragas_enabled = True    # for offline evaluation
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `model_name` | `BAAI/bge-small-en-v1.5` | Primary embedding model |
+| `fallback_model` | `all-MiniLM-L6-v2` | Fallback if BGE unavailable |
+| `chunking_mode` | `auto` | `auto` \| `recursive` \| `contextual` \| `semantic` |
+| `child_chunk_size` | 256 | Tokens per child chunk |
+| `child_chunk_overlap` | 32 | Token overlap for child chunks |
+| `parent_chunk_size` | 1024 | Tokens per parent chunk |
+| `parent_chunk_overlap` | 128 | Token overlap for parent chunks |
+| `semantic_threshold` | 0.75 | Cosine similarity boundary for semantic splitting |
+| `top_k` | 5 | Final chunks returned per query |
+| `candidate_multiplier` | 4 | Candidate pool = `top_k × multiplier` |
+| `min_candidates` | 20 | Minimum FAISS candidates regardless of top_k |
+| `hyde_enabled` | `True` | HyDE on iteration 1 |
+| `compression_enabled` | `True` | Context compression before generation |
+| `compression_max_chars` | 8000 | Character budget after compression |
+| `memory_max_turns` | 10 | Max raw turns in session window |
+| `memory_max_chars` | 4000 | Character budget before LLM compression |
+| `groundedness_threshold` | 0.70 | Min groundedness to pass guardrails |
+| `confidence_threshold` | 0.60 | Min composite confidence for final answer |
+| `ragas_enabled` | `False` | Enable RAGAS evaluation (3 extra LLM calls) |
+| `vector_backend` | `faiss` | Currently only `faiss` |
 
 ---
 
 ## Data Flow Example
 
 ```
-User: "What is the current Fed funds rate?"
+User: "What drove APEX's gross margin improvement in FY2024?"
 
-→ query_rewriter:
-    rewritten_query = "Federal Reserve federal funds rate current 2024"
+→ [1] query_rewriter:
+    session context = "" (first turn)
+    rewritten_query = "APEX Technologies FY2024 gross margin expansion drivers"
+    hyde_vec = embed(blend(query, hypothetical_passage))
 
-→ detail_checker:
-    needs_retrieval = True   (real-time data)
-    retrieval_reason = "Fed rate is time-sensitive, requires live data"
+→ [2] query_decomposer:
+    is_multi_hop = False
+    sub_queries   = ["APEX Technologies FY2024 gross margin expansion drivers"]
 
-→ source_selector:
-    selected_source = "internet"
-    rationale = "Current central bank rates require live web search"
+→ [3] detail_checker:
+    needs_retrieval = True  (specific financial figure, recent data)
 
-→ retriever:
-    calls T.web_search.run("Federal Reserve federal funds rate current 2024")
-    retrieved_context = ["As of [date], the Fed funds rate is ..."]
-    sources_used = ["web_search"]
+→ [4] source_selector:
+    selected_source = "vector_db"
+    retrieval_plan  = ["vector_db"]  (corpus has 320 chunks for APEX)
 
-→ response_generator:
-    synthesises answer from context + query
+→ [5] retriever:
+    FAISS child search with hyde_vec → 20 candidates
+    parent lookup → 20 parent chunks
+    BM25 scoring + RRF merge
+    cross-encoder rerank → top 5 parent chunks
+    retrieved_context = [chunk1, chunk2, chunk3, chunk4, chunk5]
 
-→ relevance_checker:
-    score = 0.87 → is_relevant = True
-    final_response = <answer>
+→ [6] context_compressor:
+    keyword filter: keeps 4/5 chunks
+    LLM extraction: reduces each chunk to relevant sentences
+    Jaccard dedup: no duplicates found
+    compressed_context = 3 200 chars (from 7 800 original)
+
+→ [7] response_generator:
+    "APEX's gross margin improved 210 bps to 42.3% in FY2024,
+     driven by: (1) product mix shift toward higher-margin software
+     subscriptions, (2) materials cost deflation of 8% YoY, and
+     (3) manufacturing scale benefits at the new Austin facility..."
+
+→ [8] relevance_checker:
+    relevance_score    = 0.91
+    groundedness_score = 0.88  (all figures found in context)
+    confidence_score   = 0.87  (composite)
+    is_relevant        = True
+    → save to ConversationStore session "analyst-1"
+    → final_response published
+```
+
+---
+
+## HTTP API Reference
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness + readiness — LLM, embedding model, LangChain |
+| `POST` | `/query` | Full 9-node pipeline (sync); returns answer + scores |
+| `POST` | `/stream` | Token-by-token SSE streaming |
+| `POST` | `/ingest` | Ingest a document into a ticker's FAISS store |
+| `GET` | `/collection/{ticker}` | Chunk count for a ticker |
+| `DELETE` | `/collection/{ticker}` | Drop a ticker's FAISS store (irreversible) |
+
+**POST /query request:**
+```json
+{
+  "question":     "What was APEX FY2024 FCF?",
+  "ticker":       "APEX",
+  "company_name": "APEX Technologies",
+  "session_id":   "analyst-1"
+}
+```
+
+**POST /query response:**
+```json
+{
+  "question":           "...",
+  "ticker":             "APEX",
+  "answer":             "APEX's FY2024 FCF was $2.1B...",
+  "sources_used":       ["vector_db"],
+  "relevance_score":    0.94,
+  "confidence_score":   0.87,
+  "groundedness_score": 0.91,
+  "latency_ms":         312.4
+}
+```
+
+**POST /stream** — `text/event-stream`, one token per event:
+```
+data: APEX\n\n
+data: 's\n\n
+data:  FY2024\n\n
+...
+data: [DONE]\n\n
 ```
 
 ---
@@ -520,48 +506,60 @@ User: "What is the current Fed funds rate?"
 ## Module Dependency Map
 
 ```
-main.py
-  └── graph.py
-        ├── state.py         (RAGState TypedDict)
-        └── agents.py
-              ├── config.py  (get_llm, constants)
-              ├── state.py
-              ├── vector_store.py
-              └── tools.py
-                    ├── config.py  (get_search_tool)
-                    └── vector_store.py
+rag_pipeline.py
+  ├── vector_store.py      (FAISS, BM25, cross-encoder)
+  │     └── chunking.py   (SmartChunker for ingest)
+  ├── hyde.py              (HyDE embedding blend)
+  ├── compression.py       (ContextCompressor)
+  ├── memory.py            (ConversationStore)
+  ├── guardrails.py        (GuardrailsChecker)
+  ├── tools.py             (LangChain tool wrappers)
+  └── core/config.py       (RAGConfig, LLM_CONFIG, validate_llm_config)
 
-ingest.py
-  └── vector_store.py
-        └── config.py
+evaluation.py              (standalone — does not import pipeline)
+  └── core/config.py
+
+api/server.py
+  ├── rag_pipeline.py      (run, stream_run)
+  ├── vector_store.py      (ingest_document, collection_size, clear_company)
+  └── core/config.py       (validate_llm_config, EMBEDDING_CONFIG)
 ```
 
 ---
 
-## Extending the System
+## Extending the Retrieval System
 
-### Adding a New Tool
+### Adding a new tool
 
-1. Add a `@tool`-decorated function to `tools.py`
-2. Append it to `ALL_TOOLS`
-3. Optionally import and call it in the `retriever` node (`agents.py`) for
-   pipeline-native access
+1. Add a `@tool`-decorated function in `retrieval/tools.py`
+2. Wire it into `retriever` node in `rag_pipeline.py` under the appropriate source type
+3. Add a security test in `tests/rag_backtest.py::run_security_tests()`
 
-### Adding a New LLM Provider
+### Changing the embedding model
 
-1. Add a detection branch in `_detect_provider()` in `config.py`
-2. Add a construction branch in `get_llm()` returning a `BaseChatModel` subclass
-3. Document the required env vars in `.env.example`
+```python
+from equity_research.core.config import RAG_CONFIG
+RAG_CONFIG.model_name = "BAAI/bge-base-en-v1.5"   # 768-dim, better quality
+```
 
-### Adding a New Source
+Then clear existing indices — different models have incompatible embedding dimensions:
 
-1. Add a new literal to `selected_source` type hints in `state.py`
-2. Add the source description to `_SOURCE_PROMPT` in `agents.py`
-3. Add a dispatch branch in the `retriever` node
-4. Update `"combined"` to include the new source
+```python
+from equity_research.retrieval.vector_store import clear_company
+clear_company("TICKER")   # deletes data/faiss_index/<TICKER>/
+```
 
-### Changing Chunk Strategy
+### Adding a new chunking strategy
 
-Edit `_init_llama_settings()` and the `SentenceSplitter` constructors in
-`vector_store.py`. Changing `chunk_size` requires re-ingesting all documents
-(old embeddings were computed with the previous chunk boundaries).
+1. Add a function `my_split(text, chunk_size, chunk_overlap) -> list[str]` in `chunking.py`
+2. Add a `ChunkingMode` literal
+3. Add a branch in `SmartChunker.split()` and `auto_detect_strategy()`
+
+### Disabling components for speed
+
+```python
+from equity_research.core.config import RAG_CONFIG
+RAG_CONFIG.hyde_enabled        = False   # skip HyDE (saves 1 LLM call)
+RAG_CONFIG.compression_enabled = False   # skip compression (faster, larger context)
+RAG_CONFIG.ragas_enabled       = False   # skip RAGAS (default; saves 3 LLM calls)
+```

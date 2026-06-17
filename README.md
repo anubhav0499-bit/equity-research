@@ -57,12 +57,12 @@ Weights are aligned with CFA Institute, OECD Corporate Governance Principles, an
 ## Quick Start
 
 ### Requirements
-Python 3.9+ · One LLM API key (Groq free tier works)
+Python 3.10+ · One LLM API key (Groq free tier works)
 
 ```bash
 # 1. Clone
-git clone https://github.com/anubhav0499/equity-intelligence-research.git
-cd equity-intelligence-research/equity_research
+git clone https://github.com/anubhav0499-bit/equity-research.git
+cd equity-research
 
 # 2. Install
 pip install -r requirements.txt
