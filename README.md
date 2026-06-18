@@ -1,6 +1,6 @@
 # Equity Intelligence Research Platform
 
-Autonomous institutional-grade equity research system. Given a company name or ticker, it produces a fully sourced, compliance-validated DOCX research report covering forensic accounting, financial modeling, DCF valuation, and scenario analysis — without human intervention.
+Autonomous institutional-grade equity research system. Given a company name or ticker, it produces a fully sourced, compliance-validated DOCX research report without human intervention.
 
 ## Architecture
 
