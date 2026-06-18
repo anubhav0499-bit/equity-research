@@ -244,8 +244,9 @@ print(result.confidence_score, result.grounded)
 
 ### `retrieval/evaluation.py` — RAGASEvaluator
 
-LLM-as-judge RAGAS metrics — no `ragas` package required. Disabled by default
-(`RAG_CONFIG.ragas_enabled = False`); enable for offline evaluation runs.
+LLM-as-judge RAGAS metrics — no `ragas` package required. **Offline use only** —
+not called from the live pipeline. Each call makes 3 extra LLM requests.
+Use for batch regression testing and retrieval quality benchmarking.
 
 | Metric | Judges | Aggregation |
 |---|---|---|
@@ -377,8 +378,7 @@ All RAG settings live in one dataclass (`core/config.py`). Override at runtime:
 ```python
 from equity_research.core.config import RAG_CONFIG
 RAG_CONFIG.top_k = 8
-RAG_CONFIG.hyde_enabled = False
-RAG_CONFIG.ragas_enabled = True    # for offline evaluation
+RAG_CONFIG.hyde_enabled = True   # enable when query vocab diverges from doc vocab
 ```
 
 | Field | Default | Description |
@@ -394,14 +394,13 @@ RAG_CONFIG.ragas_enabled = True    # for offline evaluation
 | `top_k` | 5 | Final chunks returned per query |
 | `candidate_multiplier` | 4 | Candidate pool = `top_k × multiplier` |
 | `min_candidates` | 20 | Minimum FAISS candidates regardless of top_k |
-| `hyde_enabled` | `True` | HyDE on iteration 1 |
+| `hyde_enabled` | `False` | HyDE — enable when query vocab diverges from doc vocab |
 | `compression_enabled` | `True` | Context compression before generation |
 | `compression_max_chars` | 8000 | Character budget after compression |
 | `memory_max_turns` | 10 | Max raw turns in session window |
 | `memory_max_chars` | 4000 | Character budget before LLM compression |
 | `groundedness_threshold` | 0.70 | Min groundedness to pass guardrails |
 | `confidence_threshold` | 0.60 | Min composite confidence for final answer |
-| `ragas_enabled` | `False` | Enable RAGAS evaluation (3 extra LLM calls) |
 | `vector_backend` | `faiss` | Currently only `faiss` |
 
 ---
@@ -553,13 +552,12 @@ clear_company("TICKER")   # deletes data/faiss_index/<TICKER>/
 
 1. Add a function `my_split(text, chunk_size, chunk_overlap) -> list[str]` in `chunking.py`
 2. Add a `ChunkingMode` literal
-3. Add a branch in `SmartChunker.split()` and `auto_detect_strategy()`
+3. Add your `doc_type` key(s) to `_DOC_TYPE_STRATEGY` and add a branch in `SmartChunker.split()`
 
 ### Disabling components for speed
 
 ```python
 from equity_research.core.config import RAG_CONFIG
-RAG_CONFIG.hyde_enabled        = False   # skip HyDE (saves 1 LLM call)
+RAG_CONFIG.hyde_enabled        = False   # default; enable when query/doc vocab diverges
 RAG_CONFIG.compression_enabled = False   # skip compression (faster, larger context)
-RAG_CONFIG.ragas_enabled       = False   # skip RAGAS (default; saves 3 LLM calls)
 ```

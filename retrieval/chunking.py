@@ -176,7 +176,27 @@ def semantic_split(
     return [c for c in chunks if c.strip()]
 
 
-# ── Auto-mode selector ──────────────────────────────────────────────────────
+# ── Doc-type routing table ──────────────────────────────────────────────────
+# Financial documents have known structures — use explicit routing before
+# falling back to heuristics so strategy selection is deterministic and
+# debuggable rather than dependent on per-document signal sampling.
+
+_DOC_TYPE_STRATEGY: dict[str, ChunkingMode] = {
+    "10-k":                  "contextual",
+    "10-q":                  "contextual",
+    "20-f":                  "contextual",
+    "annual_report":         "contextual",
+    "annual report":         "contextual",
+    "earnings_transcript":   "recursive",
+    "transcript":            "recursive",
+    "earnings_call":         "recursive",
+    "news":                  "recursive",
+    "presentation":          "recursive",
+    "investor_presentation": "recursive",
+}
+
+
+# ── Auto-mode selector (heuristic fallback) ─────────────────────────────────
 
 def auto_detect_strategy(text: str) -> ChunkingMode:
     """
@@ -227,8 +247,14 @@ class SmartChunker:
     ) -> tuple[list[str], list[dict]]:
         """Split text and return (chunk_texts, metadatas)."""
         meta = base_metadata or {}
-        mode = self.mode if self.mode != "auto" else auto_detect_strategy(text)
-        logger.debug(f"[chunking] strategy={mode} text_len={len(text)}")
+        if self.mode != "auto":
+            mode = self.mode
+        else:
+            # Prefer explicit doc_type mapping; fall back to heuristic auto-detect
+            # only for unknown document types.
+            doc_type = meta.get("doc_type", "").lower().replace(" ", "_")
+            mode = _DOC_TYPE_STRATEGY.get(doc_type) or auto_detect_strategy(text)
+        logger.debug(f"[chunking] strategy={mode} doc_type={meta.get('doc_type','?')} text_len={len(text)}")
 
         if mode == "contextual":
             items = contextual_split(text, self.chunk_size, self.chunk_overlap)

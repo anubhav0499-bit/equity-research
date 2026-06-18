@@ -1,6 +1,13 @@
 """
 RAGAS-style Evaluation — Context Relevance, Faithfulness, Answer Relevance.
 
+OFFLINE USE ONLY. This module is not called from the live RAG pipeline.
+Each `evaluate()` call makes 3 additional LLM requests. Use it for batch
+regression testing and retrieval quality benchmarking, not per-query scoring.
+
+Run via:
+    python -m equity_research.retrieval.evaluation --ticker AAPL --questions eval_qs.json
+
 Implements the three core RAGAS metrics using LLM-as-judge, without the ragas
 package dependency (heavy install, breaks on some Python versions). Results are
 fully compatible with the RAGAS 0-1 scale and can be compared against library scores.

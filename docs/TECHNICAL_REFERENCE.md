@@ -281,14 +281,14 @@ RAG_CONFIG.hyde_enabled = False
 | `parent_chunk_size` | `1024` | Tokens per parent chunk (rich context window) |
 | `top_k` | `5` | Final chunks returned per query |
 | `candidate_multiplier` | `4` | Candidate pool = `top_k × candidate_multiplier` |
-| `hyde_enabled` | `True` | Enable HyDE on first retrieval iteration |
+| `hyde_enabled` | `False` | HyDE — enable when query vocab diverges from doc vocab |
 | `compression_enabled` | `True` | Enable context compression before generation |
 | `compression_max_chars` | `8000` | Character budget after compression |
 | `memory_max_turns` | `10` | Max raw turns in session window |
 | `memory_max_chars` | `4000` | Character budget before LLM compression |
 | `groundedness_threshold` | `0.70` | Guardrails: min groundedness score to pass |
 | `confidence_threshold` | `0.60` | Min composite confidence for final answer |
-| `ragas_enabled` | `False` | Enable RAGAS evaluation (adds 3 LLM calls) |
+| `ragas_enabled` | — | Removed — use `retrieval/evaluation.py` directly for offline eval |
 | `vector_backend` | `faiss` | Currently only `faiss` |
 
 ### Output paths
@@ -667,8 +667,8 @@ LLM-as-judge evaluation — compatible with RAGAS 0–1 scale but no external de
 | `answer_relevance` | Does the response address the question? | Holistic 0–1 score |
 | `ragas_score` | — | Geometric mean of all three |
 
-Disabled by default (`RAG_CONFIG.ragas_enabled = False`) as it requires 3 extra LLM
-calls per query. Enable for evaluation runs:
+**Offline use only** — not called from the live pipeline. Each call makes 3
+additional LLM requests. Use for batch regression testing:
 
 ```python
 from equity_research.retrieval.evaluation import RAGASEvaluator

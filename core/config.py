@@ -201,7 +201,8 @@ class RAGConfig:
     top_k: int = 5
     candidate_multiplier: int = 4      # retrieve top_k × multiplier before re-ranking
     min_candidates: int = 20
-    hyde_enabled: bool = True          # Hypothetical Document Embeddings
+    hyde_enabled: bool = False         # HyDE blends hypothetical+query vectors;
+                                       # enable when query vocab diverges from docs
     # ── Compression ───────────────────────────────────────────────────
     compression_enabled: bool = True
     compression_max_chars: int = 8000
@@ -211,8 +212,6 @@ class RAGConfig:
     # ── Guardrails ────────────────────────────────────────────────────
     groundedness_threshold: float = 0.70
     confidence_threshold: float  = 0.60
-    # ── Evaluation ────────────────────────────────────────────────────
-    ragas_enabled: bool = False        # expensive — opt-in per run
     # ── Backend ───────────────────────────────────────────────────────
     vector_backend: str = "faiss"      # faiss | chroma
 
