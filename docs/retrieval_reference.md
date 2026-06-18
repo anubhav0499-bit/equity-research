@@ -25,14 +25,14 @@ research workflow. Key design decisions vs. a naive RAG setup:
 | Orchestration | **LangGraph** | 9-node state machine, conditional routing, retry loops |
 | Embeddings | `BAAI/bge-small-en-v1.5` (~130 MB local) | Dense vector encoding; L2-normalised for cosine sim |
 | Vector store | **FAISS** `IndexFlatIP` | Per-ticker persistent child + parent dual indices |
-| Chunking | **SmartChunker** | Recursive / contextual / semantic — auto-detected per doc |
+| Chunking | **SmartChunker** | Recursive / contextual / semantic — doc_type-keyed routing; heuristic fallback |
 | Hybrid retrieval | **BM25 + RRF** | Keyword scoring merged with dense rank via Reciprocal Rank Fusion |
 | Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Precision re-scoring of the candidate pool |
-| Query enhancement | **HyDE** | Hypothetical doc embedding blended 50/50 with query vector |
+| Query enhancement | **HyDE** | Opt-in (default off): hypothetical doc embedding blended 50/50 with query vector |
 | Compression | **ContextCompressor** | Keyword filter → LLM extraction → Jaccard dedup |
 | Memory | **ConversationStore** | Session-keyed sliding window with LLM rolling summary |
 | Guardrails | **GuardrailsChecker** | Rule-based + LLM faithfulness + composite confidence score |
-| Evaluation | **RAGASEvaluator** | Context relevance, faithfulness, answer relevance (geometric mean) |
+| Evaluation | **RAGASEvaluator** | Offline only — context relevance, faithfulness, answer relevance (geometric mean) |
 | Tools | LangChain `@tool` wrappers | SEC EDGAR, web search, Wikipedia, yfinance, calculator |
 | Streaming | FastAPI `StreamingResponse` | SSE token-by-token delivery via `stream_run()` |
 
@@ -87,16 +87,27 @@ User Query (+ session_id for memory)
 
 Three splitting strategies, selected manually or via auto-detect:
 
-| Strategy | Trigger heuristic | Behaviour |
-|---|---|---|
-| `contextual` | Header density > 2 per 50 lines | Splits on 10-K section headers (`ITEM`, `PART`, `MD&A`, `Risk Factors`); stores `section_header` in chunk metadata |
-| `recursive` | High number density or default | Hierarchical separator: `\n\n` → `\n` → `. ` → ` ` |
-| `semantic` | Low number density + long avg line length | Embedding-similarity boundary detection; falls back to `recursive` if embed_fn unavailable |
+**Strategy selection (in priority order):**
 
-**Auto-detect (`auto_detect_strategy`):**
-1. Header density > 2 per 50 lines → `contextual`
-2. Avg line length > 120 chars → `semantic`
-3. Otherwise → `recursive`
+1. If `mode` is set explicitly (`recursive`/`contextual`/`semantic`) — use it.
+2. If `base_metadata["doc_type"]` matches a known financial doc type — use the table:
+
+| `doc_type` value | Strategy |
+|---|---|
+| `10-k`, `10-q`, `20-f`, `annual_report` | `contextual` |
+| `transcript`, `earnings_transcript`, `earnings_call` | `recursive` |
+| `news`, `presentation`, `investor_presentation` | `recursive` |
+
+3. Unknown `doc_type` or `mode="auto"` with no metadata — heuristic fallback (`auto_detect_strategy`):
+   - Header density > 2 per 50 lines → `contextual`
+   - Avg line length > 120 chars → `semantic`
+   - Otherwise → `recursive`
+
+| Strategy | Behaviour |
+|---|---|
+| `contextual` | Splits on 10-K section headers (`ITEM`, `PART`, `MD&A`, `Risk Factors`); stores `section_header` in chunk metadata |
+| `recursive` | Hierarchical separator: `\n\n` → `\n` → `. ` → ` ` |
+| `semantic` | Embedding-similarity boundary detection; falls back to `recursive` if embed_fn unavailable |
 
 **Multi-vector ingest:** parent chunks use `SmartChunker` in `auto` mode; child chunks always use `recursive` (precision over strategy).
 

@@ -112,7 +112,7 @@ equity_research/
 │   │                           BM25+RRF+cross-encoder; persists to data/faiss_index/<TICKER>/
 │   ├── rag_pipeline.py         9-node LangGraph pipeline (HyDE, context compression,
 │   │                           guardrails, conversation memory, stream_run() SSE generator)
-│   ├── chunking.py             SmartChunker — recursive / contextual / semantic; auto-detect
+│   ├── chunking.py             SmartChunker — doc_type-keyed routing + heuristic fallback
 │   ├── hyde.py                 HyDE — generate hypothetical doc, blend embedding 50/50
 │   ├── compression.py          ContextCompressor — keyword filter → LLM extraction → dedup
 │   ├── memory.py               ConversationStore — session window + LLM rolling summary
@@ -288,7 +288,6 @@ RAG_CONFIG.hyde_enabled = False
 | `memory_max_chars` | `4000` | Character budget before LLM compression |
 | `groundedness_threshold` | `0.70` | Guardrails: min groundedness score to pass |
 | `confidence_threshold` | `0.60` | Min composite confidence for final answer |
-| `ragas_enabled` | — | Removed — use `retrieval/evaluation.py` directly for offline eval |
 | `vector_backend` | `faiss` | Currently only `faiss` |
 
 ### Output paths
@@ -573,14 +572,22 @@ Three splitting strategies selected manually or via auto-detect:
 
 | Strategy | Trigger | Behaviour |
 |---|---|---|
-| `contextual` | Auto: high header density (>2 `ITEM`/`PART`/`MD&A` headers per 50 lines) | Splits on 10-K/annual report section headers; stores `section_header` in metadata |
-| `recursive` | Auto: high number density (financial tables) or default | Hierarchical separator splitting: `\n\n` → `\n` → `. ` → ` ` |
-| `semantic` | Auto: low number density + long avg line length (narrative text) | Embedding-similarity boundary detection; falls back to recursive if embed_fn unavailable |
+Strategy is selected in this order:
 
-**Auto-detect heuristics** (`auto_detect_strategy`):
-1. If header density > 2 per 50 lines → `contextual`
-2. Else if avg line length > 120 chars → `semantic`
-3. Else → `recursive`
+1. **Explicit `mode`** parameter — always respected.
+2. **`doc_type` in `base_metadata`** — deterministic routing for known financial documents:
+   - `10-k` / `10-q` / `20-f` / `annual_report` → `contextual`
+   - `transcript` / `earnings_transcript` / `earnings_call` / `news` / `presentation` → `recursive`
+3. **Heuristic fallback** (`auto_detect_strategy`) — for unknown doc types only:
+   - Header density > 2 per 50 lines → `contextual`
+   - Avg line length > 120 chars → `semantic`
+   - Otherwise → `recursive`
+
+| Strategy | Behaviour |
+|---|---|
+| `contextual` | Splits on 10-K section headers; stores `section_header` in metadata |
+| `recursive` | Hierarchical separator splitting: `\n\n` → `\n` → `. ` → ` ` |
+| `semantic` | Embedding-similarity boundary detection; falls back to `recursive` if embed_fn unavailable |
 
 ### 7.3 HyDE (`retrieval/hyde.py`)
 
@@ -600,7 +607,8 @@ FAISS search with blended vector
 ```
 
 HyDE runs only on the first retrieval iteration (subsequent loops use the plain query
-to avoid compounding errors). Disabled when `RAG_CONFIG.hyde_enabled = False`.
+to avoid compounding errors). **Off by default** (`hyde_enabled = False`) — enable when
+analyst queries use vocabulary that differs significantly from the document corpus.
 Returns `None` on any failure — callers fall back to plain query embedding.
 
 ### 7.4 Context Compression (`retrieval/compression.py`)

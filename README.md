@@ -216,7 +216,7 @@ equity_research/
 │   ├── compression.py            # ContextCompressor — keyword filter + LLM extraction + dedup
 │   ├── memory.py                 # ConversationStore — session-keyed sliding window + LLM summary
 │   ├── guardrails.py             # GuardrailsChecker — rule-based + LLM faithfulness + confidence
-│   ├── evaluation.py             # RAGASEvaluator — context_relevance, faithfulness, answer_relevance
+│   ├── evaluation.py             # RAGASEvaluator — offline eval: context_relevance, faithfulness, answer_relevance
 │   ├── tools.py                  # LangChain tools: SEC EDGAR, web search, Wikipedia, calculator
 │   └── ingest.py                 # Document ingestion helpers
 ├── api/
