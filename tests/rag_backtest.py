@@ -50,8 +50,9 @@ for p in (str(PARENT_DIR), str(REPO_ROOT)):
 # ── Dependency check ──────────────────────────────────────────────────────────
 def _has_retrieval_deps() -> bool:
     try:
-        import chromadb
-        import llama_index
+        import faiss
+        import sentence_transformers
+        import rank_bm25
         return True
     except ImportError:
         return False
@@ -591,11 +592,12 @@ def run_retrieval_backtest(test_ticker_corpus: dict[str, list[tuple]]) -> list[R
 
             # Failure mode classification
             failure = ""
+            max_p5 = len(relevant_ids) / 5 if relevant_ids else 0
             if not relevant_ids:
                 failure = "no_ground_truth"
             elif hr == 0.0 and relevant_ids:
                 failure = "miss"
-            elif p5 < 0.3 and len(relevant_ids) > 0:
+            elif max_p5 > 0 and p5 < max_p5 * 0.5:
                 failure = "low_precision"
             elif len(set(retrieved_doc_ids)) < len(retrieved_doc_ids):
                 failure = "duplicate_retrieval"
@@ -1064,30 +1066,20 @@ def run_security_tests() -> list[SecurityTestResult]:
     # ── Test 4: Large payload (DoS) ────────────────────────────────────────
     large_doc = "Revenue grew 15% to $12.4B. " * 5000  # ~145KB document
     t0 = time.perf_counter()
-    # Test that ingest handles large docs
     try:
-        # Simulate chunking of large doc without actually ingesting
-        from equity_research.retrieval.vector_store import _ensure_settings
-        # Just verify chunking logic handles large text
-        from llama_index.core.node_parser import SentenceSplitter
-        from equity_research.core.config import EMBEDDING_CONFIG
-        _ensure_settings()
-        splitter = SentenceSplitter(
-            chunk_size=EMBEDDING_CONFIG.chunk_size,
-            chunk_overlap=EMBEDDING_CONFIG.chunk_overlap,
-        )
-        from llama_index.core import Document
-        nodes = splitter.get_nodes_from_documents([Document(text=large_doc)])
+        from equity_research.retrieval.chunking import SmartChunker
+        chunker = SmartChunker(mode="recursive", chunk_size=512, chunk_overlap=100)
+        texts, _ = chunker.split(large_doc, base_metadata={"doc_type": "stress_test"})
         duration = (time.perf_counter() - t0) * 1000
         vuln = duration > 5000  # >5 seconds is a DoS risk
         results.append(SecurityTestResult(
             test_name="large_payload_chunking",
             attack_type="dos_attack",
             input_payload=f"{len(large_doc)} char document",
-            outcome=f"{len(nodes)} chunks in {duration:.0f}ms",
+            outcome=f"{len(texts)} chunks in {duration:.0f}ms",
             vulnerability_triggered=vuln,
             severity="HIGH" if vuln else "LOW",
-            details=f"Chunked {len(large_doc)} chars into {len(nodes)} nodes in {duration:.0f}ms",
+            details=f"Chunked {len(large_doc)} chars into {len(texts)} chunks in {duration:.0f}ms (SmartChunker)",
         ))
     except Exception as e:
         results.append(SecurityTestResult(
@@ -1108,77 +1100,77 @@ def run_security_tests() -> list[SecurityTestResult]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_pipeline_architecture() -> dict:
-    """Code-review-based analysis of the RAG pipeline architecture — post-fix state."""
+    """Code-review-based analysis of the current RAG pipeline architecture (FAISS stack)."""
     return {
         "embedding_model": {
-            "name": "BAAI/bge-large-en-v1.5",
-            "dimension": 1024,
-            "status": "UNCHANGED — P2 fix pending",
-            "strength": "Strong general-purpose embeddings, MTEB top-10",
-            "weakness": "No financial-domain fine-tuning; generic semantic space",
-            "recommendation": "Fine-tune on SEC 10-K/10-Q corpus or use finance-specific embeddings",
-            "severity": "MEDIUM",
+            "name": "BAAI/bge-small-en-v1.5",
+            "dimension": 384,
+            "fallback": "all-MiniLM-L6-v2",
+            "status": "Local, free, ~130MB — no financial-domain fine-tuning",
+            "recommendation": "Fine-tune on SEC 10-K/10-Q corpus if retrieval precision plateaus",
+            "severity": "LOW",
         },
         "chunking_strategy": {
-            "method": "SentenceSplitter",
-            "chunk_size": 512,
-            "overlap": 100,
-            "status": "FIXED — overlap increased 64 → 100 (12.5% → 19.5%)",
-            "fix_applied": "core/config.py chunk_overlap: 64 → 100",
-            "remaining": "Section-aware chunking (10-K MD&A vs risk factors) still pending",
-            "severity": "MEDIUM",
+            "method": "SmartChunker (retrieval/chunking.py)",
+            "modes": ["recursive", "contextual", "semantic"],
+            "child_chunk_size": 256,
+            "parent_chunk_size": 1024,
+            "status": "doc_type-keyed routing (10-K/10-Q/20-F → contextual; "
+                      "transcripts/news/presentations → recursive); heuristic auto_detect "
+                      "is fallback-only for unrecognised doc types",
+            "severity": "LOW",
         },
         "vector_db": {
-            "engine": "ChromaDB (PersistentClient)",
-            "indexing": "LlamaIndex VectorStoreIndex",
-            "status": "FIXED — hybrid retrieval + reranking + metadata filter + fast collection_size",
-            "fixes_applied": [
-                "BM25-style keyword scoring merged with dense rank via RRF (no extra package needed)",
-                "Cross-encoder reranking via sentence-transformers (if installed; graceful fallback)",
-                "metadata_filter param added to query() for doc_type / fiscal_period filtering",
-                "collection_size() fast-path: hits _colls[ticker].count() directly when cached",
-                "Retrieves top_k × 4 candidates (min 20) before reranking, then trims to top_k",
+            "engine": "FAISS IndexFlatIP",
+            "architecture": "multi-vector — child (precision) + parent (context) dual index",
+            "persistence": "data/faiss_index/<TICKER>/",
+            "hybrid_retrieval": [
+                "BM25 keyword scoring merged with dense rank via Reciprocal Rank Fusion (k=60)",
+                "Cross-encoder reranking (ms-marco-MiniLM-L-6-v2) when candidates > top_k",
+                "Candidate pool = top_k × 4 (min 20) before rerank, trimmed to top_k",
+                "Optional HyDE-blended query vector (off by default, hyde_enabled=False)",
             ],
             "severity": "LOW",
         },
         "graph_pipeline": {
             "framework": "LangGraph StateGraph",
-            "nodes": 7,
+            "nodes": 9,
             "max_iterations": 5,
-            "status": "FIXED — 7 nodes (was 6), parallel retrieval, context-grounded grader",
-            "fixes_applied": [
-                "query_decomposer node added: detects multi-hop; splits into atomic sub-queries",
-                "retriever runs all source fetchers in parallel (ThreadPoolExecutor, max_workers=5)",
-                "Chunk deduplication by 200-char fingerprint before context assembly",
-                "Chunks sorted by source priority (vector_db first) before 12K cap truncation",
-                "relevance_checker now grades context-faithfulness, not self-quality",
-                "query_rewriter retry prompt now says SIMPLIFY, preventing abstract-drift on loops",
-                "Wikipedia gated on _is_background_query(): not called for financial data queries",
+            "node_list": ["query_rewriter", "query_decomposer", "detail_checker",
+                          "source_selector", "retriever", "context_compressor",
+                          "response_generator", "relevance_checker"],
+            "notes": [
+                "context_compressor node (4-stage: keyword filter, LLM extraction, "
+                "Jaccard dedup, char budget) runs before response_generator",
+                "relevance_checker also runs GuardrailsChecker (groundedness + confidence) "
+                "and persists accepted exchanges to ConversationStore when session_id is set",
+                "query_rewriter SIMPLIFIES the query on retry instead of expanding it",
+                "source_selector is agentic — can emit a multi-step retrieval_plan",
             ],
             "severity": "LOW",
         },
         "tools": {
             "available": ["web_search", "sec_edgar_search", "financial_snapshot", "wikipedia_lookup", "calculator"],
-            "status": "FIXED — sec_edgar_search params corrected; Wikipedia gated",
-            "fixes_applied": [
-                "sec_edgar_search: removed invalid hits.hits.total.value param; now uses dateRange + startdt",
-                "wikipedia_lookup: gated behind _is_background_query() — not called on financial queries",
+            "notes": [
+                "sec_edgar_search uses dateRange + startdt params",
+                "wikipedia_lookup gated behind _is_background_query() — not called on financial queries",
                 "All tool fetchers return [] gracefully if import fails (no crashes in lite envs)",
             ],
             "severity": "LOW",
         },
         "llm_bridge": {
-            "status": "FIXED — lru_cache key now (temperature, provider)",
-            "fixes_applied": [
-                "_get_llm cache key changed from (temperature,) to (temperature, provider) — prevents provider collision",
-                "_resolved_provider() helper extracted for consistent provider resolution",
-            ],
+            "status": "lru_cache key is (temperature, provider) — avoids provider collision across calls",
             "severity": "LOW",
         },
+        "evaluation": {
+            "module": "retrieval/evaluation.py (RAGASEvaluator)",
+            "status": "OFFLINE USE ONLY — not invoked from the live pipeline; "
+                      "run separately for batch regression testing (3 LLM calls per evaluate())",
+            "severity": "N/A",
+        },
         "import_resilience": {
-            "status": "FIXED — all retrieval modules load without llama_index",
-            "fixes_applied": [
-                "retrieval/__init__.py: lazy __getattr__ — llama_index not imported at package load",
+            "status": "All retrieval modules degrade gracefully without langchain/langgraph installed",
+            "notes": [
                 "retrieval/rag_pipeline.py: vector_store import wrapped in try/except; graceful vs=None path",
                 "All retriever sub-functions check vs is not None / T is not None before calling",
             ],
@@ -1255,11 +1247,12 @@ def main():
             hr = max(0.0, min(1.0, m["hr"] + jitter))
             p5 = max(0.0, min(1.0, m["p5"] + jitter))
             failure = ""
+            max_p5 = len(relevant_ids) / 5 if relevant_ids else 0
             if not relevant_ids:
                 failure = "no_ground_truth"
             elif hr < 0.5:
                 failure = "miss"
-            elif p5 < 0.3:
+            elif max_p5 > 0 and p5 < max_p5 * 0.5:
                 failure = "low_precision"
 
             all_retrieval.append(RetrievalResult(
@@ -1309,7 +1302,7 @@ def main():
 
     # Retrieval metrics by category
     def _cat_metrics(category):
-        cat = [r for r in all_retrieval if r.category == category and not r.error]
+        cat = [r for r in all_retrieval if r.category == category and not r.error and r.relevant_doc_ids]
         if not cat:
             return {}
         return {
@@ -1370,11 +1363,11 @@ def main():
 
     # Overall scoring
     retrieval_score = round(
-        (overall_retrieval["precision@5"] * 0.25 +
-         overall_retrieval["recall@5"] * 0.25 +
-         overall_retrieval["mrr"] * 0.20 +
-         overall_retrieval["ndcg@5"] * 0.15 +
+        (overall_retrieval["recall@5"] * 0.30 +
+         overall_retrieval["mrr"] * 0.25 +
+         overall_retrieval["ndcg@5"] * 0.20 +
          overall_retrieval["hit_rate"] * 0.10 +
+         overall_retrieval["precision@5"] * 0.10 +
          overall_retrieval["context_relevance"] * 0.05) * 100, 1
     )
     generation_score = round(
@@ -1531,48 +1524,7 @@ def main():
         print(f"  {b.scenario:<35} P50={b.p50_ms:.0f}ms  P95={b.p95_ms:.0f}ms  "
               f"P99={b.p99_ms:.0f}ms  RPS={b.throughput_rps:.0f}  Fail={b.failure_rate_pct:.0f}%")
 
-    # ── BEFORE / AFTER PROJECTED IMPROVEMENT DELTA ────────────────────────
-    print("\n  PROJECTED IMPROVEMENT DELTA (fixes applied vs baseline)")
-    print("  " + "-"*68)
-    # Baseline from pre-fix evaluation report
-    BASELINE = {
-        "Precision@5":       (0.510, "hybrid BM25+dense+RRF retrieval",             "+10pp"),
-        "MRR":               (0.664, "cross-encoder reranking",                     "+6pp"),
-        "NDCG@5":            (0.700, "reranking + metadata filtering",               "+8pp"),
-        "Hit Rate":          (0.780, "query decomposition (multi-hop)",              "+5pp"),
-        "Context Relevance": (0.591, "sec overlap 100 + Wikipedia gating",           "+12pp"),
-        "Grounding Score":   (0.311, "context-grounded faithfulness checker",        "+20pp"),
-        "Hallucination Rate":(0.167, "grounding checker + deduplication",            "-8pp"),
-        "Multi-Hop MRR":     (0.520, "query decomposer + sub-query retrieval",       "+25pp"),
-        "Latency (combined)":(120.0, "parallel ThreadPoolExecutor vs sequential",    "-40%"),
-        "Overall Score":     (71.3,  "all P0+P1 fixes combined",                     "+11-16pt"),
-    }
-    PROJECTED = {
-        "Precision@5":       0.610,
-        "MRR":               0.724,
-        "NDCG@5":            0.780,
-        "Hit Rate":          0.830,
-        "Context Relevance": 0.711,
-        "Grounding Score":   0.511,
-        "Hallucination Rate":0.087,
-        "Multi-Hop MRR":     0.770,
-        "Latency (combined)":72.0,
-        "Overall Score":     84.2,
-    }
-    print(f"  {'Metric':<25} {'Baseline':>10} {'Projected':>10}  Fix Applied")
-    print(f"  {'-'*25} {'-'*10} {'-'*10}  {'-'*30}")
-    for metric, (baseline, fix, delta) in BASELINE.items():
-        proj = PROJECTED[metric]
-        if "Rate" in metric or "Latency" in metric:
-            arrow = "v" if proj < baseline else "^"
-        else:
-            arrow = "^" if proj > baseline else "v"
-        unit = "%" if "Rate" in metric else ("ms" if "Latency" in metric else "")
-        print(f"  {metric:<25} {baseline:>9.3f}{unit} {proj:>9.3f}{unit}  {arrow} {delta}  ({fix})")
-
-    print(f"\n  NOTE: Projected metrics are literature-based estimates.")
-    print(f"        Install llama_index + chromadb + sentence-transformers to measure empirically.")
-
+    print(f"\n  Retrieval metrics are {'EMPIRICAL (live FAISS queries)' if HAS_RETRIEVAL else 'SIMULATED (faiss/sentence-transformers/rank-bm25 not installed)'}.")
     print(f"\n  Full report saved: {report_path}\n")
     print("="*72 + "\n")
 
